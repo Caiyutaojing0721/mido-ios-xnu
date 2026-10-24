@@ -533,6 +533,51 @@ zig cc -target aarch64-freestanding -c sweet_early.c
 
 上一版留在 `out/shim-mido-xnu-gz.prev.img`。
 
+#### 1.6.8 第三次上机：还是只有 stage 0 —— 改实验设计（`0098`）
+
+带 `0097` 的内核上机后，屏幕依旧停在 shim 那 14 行，左下角只有 stage 0 的白色小块，
+一条 `SWEET EARLY` 都没有。
+
+用 capstone 把 `kernel.development.sweet` 反汇编了一遍，四条静态结论说明**这段代码按理应该能跑**：
+
+* stage 0 读的是 `[x20,#40]`（`v_baseAddr`）、`#56`（`v_rowBytes`）、`#72`（`v_height`），
+  与 shim 写入一致；白带位置也对，所以它确实执行了；
+* `adrp` 是 PC 相对的，运行时得到的是**物理地址**（被 `load_pa - link_base` 偏移过），
+  所以 `add x22 / sub x23` 那套“转 KVA”的算法是自洽的，栈落在 `0xfffffe00080c4000`（合法 KVA）；
+* 页表布局：TTBR0 根在 `bootstrap_pagetables+0`、TTBR1 根在 `+0x4000`、V=P 的 L2 在 `+0x8000`
+  （`add x13, x25, #8, lsl #12` 证实 `PGBYTES=16K`），根索引用 VA[46:36]、L2 索引用 VA[35:25]，
+  因此 splash 块写进 `l2[0x48]` 本身是**正确**的；
+* 内核模板 TCR = `T0SZ=T1SZ=17`（47 位 VA）、`IPS=2`（40 位 PA）；`0x90001000` 走 TTBR0、
+  `0xfffffe…` 走 TTBR1，与建表方式一致。
+
+既然静态分析解释不了，就**换实验设计而不是继续猜**。`0098-mido-early-console.patch`：
+
+1. `sweet_early.c` 在 `arm_vm_init()` 调用 `sweet_early_relocate()` **之前完全不碰 framebuffer**
+   （新增 `early_fb_live`，`put` / `putc` / `mark` / `panic` 全部提前返回）。标记 1–7 因此不可能再触发缺页。
+2. `start.s` 删掉已无用的 bootstrap splash 映射，改为在 **MMU 仍关闭**时画两个进度块（物理写，不会失败）：
+
+| 块 | 位置（底部一行，单位 dword） | 含义 |
+| --- | --- | --- |
+| 白 | 0 | stage 0（原有）|
+| 绿 | 96 | 页表与 V=P / KVA 两套映射都建完 |
+| 黄 | 192 | 即将写 `SCTLR_EL1`（开 MMU）|
+
+判读方式：
+
+* **只有白** → 死在建页表之前或之中（`create_bootstrap_mapping` 一带）；
+* **白 + 绿** → 死在开 MMU 或 `ret` 到 `arm_init` 之间；
+* **白 + 绿 + 黄** 且屏幕静止 → 死在 MMU 打开之后，或没走到 `sweet_early_map_final`；
+* **白 + 绿 + 黄** 之后出现 `SWEET EARLY 08/09…` 与 XNU 日志 → 已经越过，接着看 fbcon。
+
+验证三条（都在仓库根目录跑）：
+
+```sh
+tools/mkpatch_mido_early.py   # 合成树导出 diff + 「apply 后逐字节比对」回放
+tools/check_early_asm.py      # 两段内联汇编单独用 zig cc -target aarch64-freestanding 汇编
+python -m ziglang cc -target aarch64-freestanding -DSWEET -c \
+    out/p98/osfmk/arm64/sweet_early.c    # C 部分（stub 头见 out/p97/stub）
+```
+
 ## 2. 交付物一览
 
 ```
@@ -544,12 +589,15 @@ tools/payload_repack.py                 # 换 ADT/命令行重打包 SWEETXNU pa
 tools/mk_mido_boot.py                   # 装 boot.img：shim Image + mido DTB + payload，带自校验
 tools/mkpatch_mido_fbcon.py             # 生成 0096：合成树回放 0003→0012 后导出 diff，并自校验
 tools/check_fbcon_block.py              # 把 fbcon 块单独用 zig cc -target aarch64-freestanding 编一遍
+tools/mkpatch_mido_early.py             # 生成 0098：合成树导出 diff + 逐字节回放
+tools/check_early_asm.py                # 把 start.s 里两段进度块单独汇编
 xnu/patches-mido/0094-mido-display-scaling.patch   # iPhone X 画布按高度缩放进 1080×1920
 xnu/patches-mido/0095-mido_board.patch             # bsd/dev/mido_board.c（板型判定）
 xnu/patches-mido/0095-mido_emmc.patch              # bsd/dev/mido_emmc.c（eMMC 门禁 stub）
 xnu/patches-mido/0095-mido_gpu.patch               # bsd/dev/mido_gpu.c（Adreno 506 门禁 stub）
 xnu/patches-mido/0096-mido-fbcon-24bpp.patch       # fbcon 读 ADT depth、支持 24bpp 绘制（自建内核用）
 xnu/patches-mido/0097-mido-early-console.patch     # 引导期控制台：映射 mido 开屏、按 24bpp 画
+xnu/patches-mido/0098-mido-early-console.patch     # 控制台延后到最终映射；start.s 加两段 MMU 前进度块
 xnu/patches-mido/src/                  # 上述 .c 的参考源（patch 由它生成）
 xnu/patches-mido/mido-hook.sh          # 把 mido 驱动接入 conf/files 与初始化的本地脚本
 shim/emmc.c shim/emmc.h                # 只读 eMMC/SDHCI 探针

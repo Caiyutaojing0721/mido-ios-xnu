@@ -1,0 +1,180 @@
+mido: keep the early console off the panel until its mapping is real
+
+The kernel still stops right after the stage-0 white band, which is drawn
+with the MMU off through the physical address.  Everything after that writes
+the splash through a virtual address, and an unmapped VA there is fatal: the
+low vectors are plain "b ." loops, so the machine just freezes.
+
+The bootstrap tables do appear to map the splash block, but reviewing them has
+not explained the freeze.  Change the experiment instead of the guess:
+
+  * sweet_early.c keeps quiet until arm_vm_init() has installed the final
+    alias for the splash and calls sweet_early_relocate().  Before that no
+    code path touches the panel at all, so those markers cannot fault.
+
+  * start.s drops the bootstrap splash mapping (nothing needs it now) and
+    draws two breadcrumbs while the MMU is still off, i.e. with plain
+    physical stores that cannot fail:
+        green   page tables built, V=P and KVA mappings installed
+        yellow  immediately before SCTLR_EL1 is written
+
+With the existing white stage-0 band that splits the window in three: white
+only means the table build (or something just before it) is at fault, white +
+green means the MMU enable or the jump to arm_init() is, and white + green +
+yellow with a silent screen means the fault is on the far side of the MMU.
+
+Once the kernel survives, marks 8..20 plus fbcon print normally through the
+kernel's own mapping.
+
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index e29d42b..c3b0752 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -690,22 +690,33 @@ Lkernelcache_base_found:
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
+-#if defined(SWEET)
++
+ 	/*
+-	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+-	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+-	 * create_bootstrap_mapping would replace the RAM L2 table.
+-	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+-	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
++	 * Breadcrumb (page tables and mappings built). The MMU is still off, so this writes the
++	 * physical address from boot_args and cannot fault.
+ 	 */
+-	MOV64	x10, 0x90000000
+-	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+-	orr		x11, x11, x10
+-	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+-	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+-	add		x13, x25, #(2 * PGBYTES)
+-	str		x11, [x13, x12, lsl #TTE_SHIFT]
+-#endif
++	ldr		x9, [x20, #40]			/* Video.v_baseAddr */
++	cbz		x9, 1f
++	ldr		x4, [x20, #56]			/* Video.v_rowBytes */
++	cbz		x4, 1f
++	ldr		x2, [x20, #72]			/* Video.v_height */
++	cmp		x2, #32
++	b.lo	1f
++	sub		x2, x2, #32
++	madd	x9, x2, x4, x9
++	mov		x3, #96
++	add		x9, x9, x3, lsl #2
++	mov		w1, #0x0000FF00
++	mov		x2, #32
++2:	mov		x3, #64
++	mov		x5, x9
++3:	str		w1, [x5], #4
++	subs	x3, x3, #1
++	b.ne	3b
++	add		x9, x9, x4
++	subs	x2, x2, #1
++	b.ne	2b
++1:
+ 
+ 	/* Ensure TTEs are visible */
+ 	dsb		ish
+@@ -845,6 +856,33 @@ common_start:
+ #endif /* HAS_APPLE_PAC */
+ 
+ 	// Enable caches, MMU, ROP and JOP
++
++	/*
++	 * Breadcrumb (about to enable the MMU). The MMU is still off, so this writes the
++	 * physical address from boot_args and cannot fault.
++	 */
++	ldr		x9, [x20, #40]			/* Video.v_baseAddr */
++	cbz		x9, 1f
++	ldr		x4, [x20, #56]			/* Video.v_rowBytes */
++	cbz		x4, 1f
++	ldr		x2, [x20, #72]			/* Video.v_height */
++	cmp		x2, #32
++	b.lo	1f
++	sub		x2, x2, #32
++	madd	x9, x2, x4, x9
++	mov		x3, #192
++	add		x9, x9, x3, lsl #2
++	mov		w1, #0x0000FFFF
++	mov		x2, #32
++2:	mov		x3, #64
++	mov		x5, x9
++3:	str		w1, [x5], #4
++	subs	x3, x3, #1
++	b.ne	3b
++	add		x9, x9, x4
++	subs	x2, x2, #1
++	b.ne	2b
++1:
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 81f2f7e..2d79d95 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -14,6 +14,13 @@
+ static volatile uint8_t *early_fb = (volatile uint8_t *)(uintptr_t)0x90001000;
+ static unsigned int early_width = 1080, early_height = 1920;
+ static unsigned int early_stride = 3240, early_bpp = 3;
++
++/*
++ * The bootstrap page tables are not known to cover the panel, and an
++ * unmapped write is fatal this early. Stay silent until arm_vm_init()
++ * has installed a real alias and calls sweet_early_relocate().
++ */
++static unsigned int early_fb_live;
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH early_width
+ #define EARLY_HEIGHT early_height
+@@ -33,8 +40,12 @@ extern unsigned char iso_font[256 * 16];
+ static void
+ sweet_early_put(unsigned int x, unsigned int y, uint32_t color)
+ {
+-	volatile uint8_t *p = EARLY_FB + (uintptr_t)y * EARLY_STRIDE +
+-	    (uintptr_t)x * early_bpp;
++	volatile uint8_t *p;
++
++	if (!early_fb_live) {
++		return;
++	}
++	p = EARLY_FB + (uintptr_t)y * EARLY_STRIDE + (uintptr_t)x * early_bpp;
+ 
+ 	if (early_bpp == 4) {
+ 		*(volatile uint32_t *)p = color;
+@@ -88,7 +99,7 @@ sweet_early_clear_row(void)
+ void
+ sweet_early_putc(char c)
+ {
+-	if (early_disabled) {
++	if (early_disabled || !early_fb_live) {
+ 		return;
+ 	}
+ 	if (!early_started) {
+@@ -135,7 +146,7 @@ sweet_early_string(const char *s)
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
+-	if (early_disabled || stage > 20) {
++	if (early_disabled || !early_fb_live || stage > 20) {
+ 		return;
+ 	}
+ 	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+@@ -174,9 +185,13 @@ sweet_early_panic(const char *fmt, va_list *args)
+ void
+ sweet_early_relocate(uint64_t base)
+ {
+-	sweet_early_mark(8, "leaving bootstrap TTBR0");
+ 	early_fb = (volatile uint8_t *)(uintptr_t)base;
++	early_row = 0;
++	early_col = 0;
++	early_started = 0;
++	early_fb_live = 1;
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_early_mark(8, "leaving bootstrap TTBR0");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+ 
