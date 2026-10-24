@@ -578,6 +578,53 @@ python -m ziglang cc -target aarch64-freestanding -DSWEET -c \
     out/p98/osfmk/arm64/sweet_early.c    # C 部分（stub 头见 out/p97/stub）
 ```
 
+#### 1.6.9 第四次上机：白 + 绿 + 黄 —— 把观测点搬过 MMU 边界（`0099`）
+
+真机回报底部是**白 + 绿 + 黄**三种颜色。这同时证明两件事：`0098` 的两段进度块确实编进了
+内核，而且内核一路健康地走到了 `MOV64 x0, SCTLR_EL1_DEFAULT` 的前一条指令。
+
+**一个必须记住的事实**：`sweet_early_mark()` 的调用点**全部**在 `arm_vm_init.c` 里，而且
+都在 `sweet_early_relocate()` 之后（`grep -rn sweet_early_ arm_vm_init.c` 可见 10–14 号）。
+也就是说 `0097` 的“一条日志都没有”和 `0098` 的“只有三块颜色”**并不能证明 MMU 打开后立刻
+出事**——在到达 `arm_vm_init()` 之前，内核本来就没有任何输出能力。观测点必须自己搬到
+MMU 的另一侧。
+
+顺带排除了两个候选根因：
+
+* **TCR 是对的。** `0x226511a511` 解出来是 `T0SZ=T1SZ=17`、`TG0=0b10`、`TG1=0b01`。
+  注意 ARM 规范里 `TG1` 的编码与 `TG0` **不同**（`TG1=0b01` 才是 16K，见 `proc_reg.h:858`），
+  所以这个值恰好是 16K granule 的正确写法，不要“修”它。
+* **`SCTLR_EL1_DEFAULT` 不含 `WXN`，`ARM_TTE_BOOT_BLOCK` 不含 `PXN`**，所以 MMU 打开后
+  继续执行 V=P 映射里的代码不会取指异常。
+
+`0099-mido-mmu-trace.patch` 因此改三处：
+
+1. **把 splash 的 V=P 映射加回来**（一个 32MB Normal-NC block，写进已有的 V=P L2 表，
+   `add x13, x25, #(2 * PGBYTES)`）。这是下面两项成立的前提。
+2. **第 4 个进度块（洋红）紧跟在 `MSR SCTLR_EL1` + `isb` 之后**。它仍然是物理写：只有
+   MMU 真的开了、V=P 映射真的有效，它才会出现在屏幕上。
+3. **16 个 low vector 槽位全部跳到一个“画红块然后停住”的处理程序**。该程序不用栈、
+   不读 `boot_args`，几何全部写死（`0x90001000 + (1920-32)*3240 + 512*3 = 0x905D7080`），
+   所以 MMU 开或关都有效。以前“静默死机”和“异常”长得一模一样，现在异常会留下红块。
+
+底部一行从左到右：白、绿（+128px）、黄（+256px）、洋红（+384px）、红（+512px）。
+
+| 看到的颜色 | 含义 |
+| --- | --- |
+| 白 | 建页表（或它之前）出错 |
+| 白 + 绿 | 开 MMU / 跳 `arm_init` 之间出错 |
+| 白 + 绿 + 黄 | `MSR SCTLR_EL1` 或紧随的 `isb` 就出错 |
+| 白 + 绿 + 黄 + 洋红 | **MMU 已开且 V=P 有效**，问题在其后 |
+| 再加一块红 | 确实发生了异常（而且向量表可执行、painter 能写屏）|
+| 只有白绿黄 + 红 | MMU 一开就异常，但向量表还能跑（说明 V=P 映射部分可用）|
+
+验证（都在仓库根目录跑）：
+
+```sh
+tools/mkpatch_mido_mmu_trace.py   # 合成树导出 diff + 逐字节回放
+tools/check_mmu_trace_asm.py      # 单独汇编向量表与 painter，并检查 16 个槽位都是合法 b
+```
+
 ## 2. 交付物一览
 
 ```
@@ -591,6 +638,8 @@ tools/mkpatch_mido_fbcon.py             # 生成 0096：合成树回放 0003→0
 tools/check_fbcon_block.py              # 把 fbcon 块单独用 zig cc -target aarch64-freestanding 编一遍
 tools/mkpatch_mido_early.py             # 生成 0098：合成树导出 diff + 逐字节回放
 tools/check_early_asm.py                # 把 start.s 里两段进度块单独汇编
+tools/mkpatch_mido_mmu_trace.py         # 生成 0099：splash V=P 映射 + 洋红块 + 异常 painter
+tools/check_mmu_trace_asm.py            # 单独汇编向量表/painter，校验 16 个槽位可跳
 xnu/patches-mido/0094-mido-display-scaling.patch   # iPhone X 画布按高度缩放进 1080×1920
 xnu/patches-mido/0095-mido_board.patch             # bsd/dev/mido_board.c（板型判定）
 xnu/patches-mido/0095-mido_emmc.patch              # bsd/dev/mido_emmc.c（eMMC 门禁 stub）
@@ -598,6 +647,7 @@ xnu/patches-mido/0095-mido_gpu.patch               # bsd/dev/mido_gpu.c（Adreno
 xnu/patches-mido/0096-mido-fbcon-24bpp.patch       # fbcon 读 ADT depth、支持 24bpp 绘制（自建内核用）
 xnu/patches-mido/0097-mido-early-console.patch     # 引导期控制台：映射 mido 开屏、按 24bpp 画
 xnu/patches-mido/0098-mido-early-console.patch     # 控制台延后到最终映射；start.s 加两段 MMU 前进度块
+xnu/patches-mido/0099-mido-mmu-trace.patch         # splash 的 V=P 映射 + MMU 后洋红块 + 异常红块 painter
 xnu/patches-mido/src/                  # 上述 .c 的参考源（patch 由它生成）
 xnu/patches-mido/mido-hook.sh          # 把 mido 驱动接入 conf/files 与初始化的本地脚本
 shim/emmc.c shim/emmc.h                # 只读 eMMC/SDHCI 探针
