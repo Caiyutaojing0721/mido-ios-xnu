@@ -508,6 +508,31 @@ zig cc -target aarch64-freestanding -c sweet_early.c
 修好后的预期：屏幕会按 24bpp 正常显示 `SWEET EARLY 01: arm_init entered (MMU on)` 到
 `SWEET EARLY 20: kprintf startup complete` 这条链，卡在哪一步一眼就能看出来。
 
+#### 1.6.7 带 `0097` 的内核与镜像（第二次 CI）
+
+`kernel.development.sweet` 17,273,280 B，
+`32d853bd507714f46afd7083baf239d664fb51033937e8a837dc084c70792df0`（比上一版大 16,408 B）。
+
+从 `buildtree.tgz` 直接验到 `0097` 落地：`start.s:701` = `MOV64 x10, 0x90000000`；
+`sweet_early.c` 里 `early_bpp` / `sweet_early_put` / `early_stride = 3240` 全在，且
+`0096` 的 `fbcon_bpp` / `fbcon_put` / `"depth"` 也仍在（两条补丁互不干扰）。
+
+顺带确认了一个**不是**问题的地方：`arm_vm_init.c` 里 `uint64_t fb = 0x9c000000ULL;` 只是缺省值，
+紧接着会被 `args->Video.v_baseAddr` 覆盖，所以标记 9 以后的重定位（`sweet_early_relocate`）
+在 mido 上同样落在真屏，不需要再改。
+
+成品镜像 `out/shim-mido-xnu-gz.img` 16,910,336 B，
+`728788bb1e4dc70cea8a6d54c755a9eec9c3ae4a2dcf1df0aba4ea1d3e95bb1f`：
+
+| 项 | 值 |
+| --- | --- |
+| kernel blob | gzip 15,157 B + stock DTB 247,356 B（FDT `0x3335`，与 stock 逐字节相同） |
+| ramdisk | payload 16,646,080 B，`phys_base 0x98000000` / `mem_size 0x28000000` |
+| 内嵌 ADT | 10,764 B，与 `out/mido.adt` 相同（`adt_off 0xfdd5b0`） |
+| 段 0 | `__TEXT 0xfffffe0007004000`，`file_size 0x164000`，与 CI 内核前 1,458,176 B 逐字节相同 |
+
+上一版留在 `out/shim-mido-xnu-gz.prev.img`。
+
 ## 2. 交付物一览
 
 ```
