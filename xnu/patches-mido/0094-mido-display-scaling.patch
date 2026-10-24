@@ -1,0 +1,72 @@
+# Redmi Note 4X (mido) display scaling.
+#
+# Mirrors 0082-sweet-polaris-display-scaling.patch but for the mido 1080x1920
+# (16:9) panel: the iPhone X 1125x2436 logical canvas is scaled by HEIGHT into
+# the panel (887x1920, ~96px black bars each side). The generic fScale path
+# added by 0082 already handles present()/touch() mapping, so only the two
+# board branches need a mido case.
+#
+# Best-effort: this patch targets the post-0082/0083 SweetFramebuffer.cpp and
+# SweetHID.cpp. It is applied with `git apply --3way` by xnu-mido.yml and is
+# SKIPPED (never force-rejected) if the context no longer matches your tree.
+# Re-base against your ios-sweet checkout if it does not apply.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -167,6 +167,8 @@ AppleCLCD::start(IOService *provider)
+ 	int native = 0;
+ 	int polaris = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	PE_parse_boot_argn("sweetfb_polaris", &polaris, sizeof(polaris));
++	int mido = 0;
++	PE_parse_boot_argn("sweetfb_mido", &mido, sizeof(mido));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+ 	fContentW = fWidth;
+@@ -184,6 +186,17 @@ AppleCLCD::start(IOService *provider)
+ 		fOffX = (int32_t)(fWidth - fContentW) / 2;
+ 		fOffY = 0;
+ 		fScale = 1;
++	} else if (!native && mido) {
++		/*
++		 * Redmi Note 4X (mido) is 1080x1920 (16:9). Fit the iPhone X
++		 * logical display by height (887x1920) with black ~96-pixel
++		 * bars on the sides. Same fScale path as polaris.
++		 */
++		fContentW = (fLogicalW * fHeight + fLogicalH / 2) / fLogicalH;
++		fContentH = fHeight;
++		fOffX = (int32_t)(fWidth - fContentW) / 2;
++		fOffY = 0;
++		fScale = 1;
+ 	} else {
+ 		fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 		fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -433,6 +433,8 @@ SweetHIDTouch::start(IOService *provider)
+ 	int native = 0;
+ 	int polaris = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	PE_parse_boot_argn("sweetfb_polaris", &polaris, sizeof(polaris));
++	int mido = 0;
++	PE_parse_boot_argn("sweetfb_mido", &mido, sizeof(mido));
+ 	fLogicalW = native ? 1080 : 1125;
+ 	fLogicalH = native ? 2400 : 2436;
+ 	fPanelW = 1080;
+@@ -450,6 +452,16 @@ SweetHIDTouch::start(IOService *provider)
+ 		fOffX = (fPanelW - fContentW) / 2;
+ 		fOffY = 0;
+ 		fScale = 1;
++	} else if (!native && mido) {
++		/* mido 1080x1920: the logical display is scaled by height. */
++		fPanelH = 1920;
++		fContentW = (fLogicalW * fPanelH + fLogicalH / 2) / fLogicalH;
++		fContentH = fPanelH;
++		fOffX = (fPanelW - fContentW) / 2;
++		fOffY = 0;
++		fScale = 1;
+ 	} else {
+ 		fContentW = fPanelW;
+ 		fContentH = fPanelH;

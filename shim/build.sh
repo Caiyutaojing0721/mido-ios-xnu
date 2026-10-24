@@ -8,12 +8,21 @@
 # Works with aarch64-linux-gnu-gcc, aarch64-unknown-linux-gnu-gcc, or the
 # bundled Zig (Windows/macOS/Linux). Packing needs only Python.
 set -euo pipefail
+CALLER=$(pwd)
 cd "$(dirname "$0")"
 ROOT=$(cd .. && pwd)
 TOOLS=$ROOT/tools
 OUT=$ROOT/out
 PLATFORM=${PLATFORM:-sweet}
 PAYLOAD=${1:-}
+# The script cd's into shim/, so resolve a relative payload against the
+# caller's directory instead of silently failing to find it.
+if [ -n "$PAYLOAD" ]; then
+	case "$PAYLOAD" in
+		/*) ;;
+		*) PAYLOAD=$CALLER/$PAYLOAD ;;
+	esac
+fi
 mkdir -p "$OUT"
 
 PY=${PY:-}
@@ -24,8 +33,11 @@ if [ -z "$PY" ]; then
 fi
 [ -n "$PY" ] || { echo 'error: no working python' >&2; exit 1; }
 
-CROSSFLAGS="-DPOLARIS"
-[ "$PLATFORM" = polaris ] || CROSSFLAGS=""
+case "$PLATFORM" in
+	polaris) CROSSFLAGS="-DPOLARIS" ;;
+	mido)    CROSSFLAGS="-DMIDO" ;;
+	*)       CROSSFLAGS="" ;;
+esac
 
 if [ -n "${CROSS:-}" ]; then
 	CC="${CROSS}gcc"
@@ -57,7 +69,7 @@ CFLAGS="-O2 -g0 -ffreestanding -nostdlib -fno-builtin -fno-pic -mgeneral-regs-on
 	-fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
 	-mno-outline-atomics -Wall -Wextra $CROSSFLAGS ${EXTRA_CFLAGS:-}"
 OBJS=()
-for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c libc.c; do
+for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c emmc.c libc.c; do
 	o=$OUT/${f%.*}.o
 	$CC $CFLAGS -c "$f" -o "$o"
 	OBJS+=("$o")
@@ -89,6 +101,14 @@ if [ -n "$PAYLOAD" ]; then
 	if [ "$PLATFORM" = polaris ]; then
 		rd_limit=$((0x1dea000 - 0x1000000))
 		dtb_pa=0x1dea000
+	elif [ "$PLATFORM" = mido ]; then
+		# MEASURED: mido's stock boot.img keeps the DTB *inside* the kernel
+		# blob (Image.gz followed by the DTB), not at a fixed physical address.
+		# There is therefore no ramdisk/DTB collision like polaris has; the
+		# ramdisk at 0x81000000 can grow until the cont_splash reservation at
+		# 0x90001000 (~240 MiB).
+		rd_limit=$((0x90001000 - 0x81000000))
+		dtb_pa=0
 	else
 		rd_limit=$((0x1f00000 - 0x1000000))
 		dtb_pa=0x1f00000
@@ -107,6 +127,42 @@ if [ "$PLATFORM" = polaris ]; then
 	# polaris ABL rejects an uncompressed Image and drops to fastboot; it
 	# accepts the same kernel gzip-compressed with the stock DTB appended.
 	gzip -9 -n -c "$OUT/Image" > "$KERNEL"
+elif [ "$PLATFORM" = mido ]; then
+	# MEASURED from the device's stock boot.img: the kernel blob is a gzip
+	# stream followed by the DTB, and kernel_size covers both (the FDT magic
+	# sits 12,366,891 bytes into a 12,612,199-byte kernel blob and the DTB ends
+	# exactly at the blob end). Reproduce that layout, or the ABL has no DTB.
+	#
+	# But the shim is NOT a Linux kernel: nothing would decompress a gzip
+	# stream here, so the Image goes in raw. ABL locates the DTB by walking
+	# FDT magic from the arm64 header's image_size, which works for a raw
+	# Image exactly as it does for the santoni reference shim.
+	MIDO_DTB=$OUT/mido-stock.dtb
+	if [ ! -f "$MIDO_DTB" ]; then
+		for cand in "$ROOT/dtb/mido_stock/mido.dtb" "$ROOT/dtb/boot_unpacked/dtb"; do
+			if [ -f "$cand" ]; then
+				cp "$cand" "$MIDO_DTB"
+				break
+			fi
+		done
+	fi
+	# The stock mido kernel is gzip + appended DTB, so ABL definitely accepts
+	# that shape. A raw Image + DTB is what the santoni reference uses, but the
+	# mido ABL rejected our raw build with "dtb not found", so both layouts are
+	# buildable here: set MIDO_KERNEL_GZIP=1 for the stock-exact one.
+	if [ -n "${MIDO_KERNEL_GZIP:-}" ]; then
+		gzip -9 -n -c "$OUT/Image" > "$KERNEL"
+		echo "kernel: Image.gz (stock-exact, MIDO_KERNEL_GZIP=1)" >&2
+	else
+		cp "$OUT/Image" "$KERNEL"
+	fi
+	if [ -f "$MIDO_DTB" ]; then
+		cat "$MIDO_DTB" >> "$KERNEL"
+		echo "kernel: + $(wc -c < "$MIDO_DTB" | tr -d ' ') byte stock DTB" >&2
+	else
+		echo 'warning: no mido stock DTB found (expected dtb/mido_stock/mido.dtb).' >&2
+		echo '         Extract it with: python3 tools/mido_dtb.py <boot.img> --extract dtb/mido_stock/mido.dtb' >&2
+	fi
 else
 	cp "$OUT/Image" "$KERNEL"
 fi
@@ -134,6 +190,27 @@ EOF
 		--tags_offset 0x100 --dtb_offset 0x1dea000 \
 		--os_version 0x200001a2 \
 		--cmdline "$(cat "$OUT/polaris.cmdline")"
+elif [ "$PLATFORM" = mido ]; then
+	# All geometry below is MEASURED from the stock crDroid boot.img header:
+	#   kernel_addr 0x80008000, ramdisk_addr 0x81000000, tags_addr 0x80000100,
+	#   page_size 2048, header v0, os_version 0x1e000191.
+	# The DTB already rode along inside $KERNEL (see above), so no --dtb here.
+	cat > "$OUT/mido.cmdline" <<'EOF'
+console=ttyMSM0,115200n8 androidboot.hardware=qcom androidboot.console=ttyMSM0 msm_rtb.filter=0x237 ehci-hcd.park=3 androidboot.bootdevice=7824900.sdhci androidboot.boot_devices=soc/7824900.sdhci androidboot.selinux=permissive
+EOF
+	# A payload build is the full XNU image; keep it apart from the probe image.
+	IMG=$OUT/shim-mido-boot.img
+	[ -n "$PAYLOAD" ] && IMG=$OUT/shim-mido-xnu.img
+	[ -n "${MIDO_KERNEL_GZIP:-}" ] && IMG=${IMG%.img}-gz.img
+	# base 0 + absolute offsets reproduces the stock header field-for-field
+	# (including second_addr == 0, which --base 0x80000000 would break).
+	$PY "$TOOLS/mkbootimg.py" -o "$IMG" \
+		--kernel "$KERNEL" --ramdisk "$OUT/ramdisk.bin" \
+		--header_version 0 --pagesize 2048 --base 0 \
+		--kernel_offset 0x80008000 --ramdisk_offset 0x81000000 \
+		--tags_offset 0x80000100 --second_offset 0 \
+		--os_version 0x1e000191 \
+		--cmdline "$(cat "$OUT/mido.cmdline")"
 else
 	if [ -f "$ROOT/dtb/boot_unpacked/dtb" ]; then
 		cat "$ROOT/dtb/boot_unpacked/dtb" >> "$KERNEL"

@@ -1,0 +1,83 @@
+diff --git a/bsd/dev/mido_emmc.c b/bsd/dev/mido_emmc.c
+new file mode 100644
+index 0000000..3fa9b2b
+--- /dev/null
++++ b/bsd/dev/mido_emmc.c
+@@ -0,0 +1,77 @@
++/*
++ * Redmi Note 4X (mido) eMMC 5.1 root-device gate.
++ *
++ * mido uses eMMC (SDHCI / SDCC1), NOT UFS like sweet/polaris. There is no
++ * MSM8953 root-on-eMMC backend in this revision: the storage bring-up is the
++ * single biggest unimplemented piece of the mido port (see docs/MIDO.md).
++ * This file only refuses, default-off, until a real, owned backend exists.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++extern int mido_board_known(void);
++
++enum mido_emmc_stage {
++	MIDO_EMMC_BOARD,
++	MIDO_EMMC_CONTROLLER,
++	MIDO_EMMC_CLOCK,
++	MIDO_EMMC_CARD,
++	MIDO_EMMC_PARTITION,
++	MIDO_EMMC_ROOT,
++	MIDO_EMMC_STAGE_COUNT
++};
++
++static const char *const mido_emmc_stage_name[MIDO_EMMC_STAGE_COUNT] = {
++	"board", "controller", "clock", "card", "partition", "root"
++};
++
++static int mido_emmc_stage = 0;
++
++/*
++ * No stage past BOARD owns a resource in this revision. The contract is the
++ * same as the polaris GPU gate: an acquired resource must have a release
++ * backend before any power/IO code is enabled.
++ */
++static int
++mido_emmc_enter(enum mido_emmc_stage stage)
++{
++	if (stage != (enum mido_emmc_stage)mido_emmc_stage ||
++	    stage >= MIDO_EMMC_STAGE_COUNT)
++		return 0;
++	if (stage != MIDO_EMMC_BOARD) {
++		printf("MIDO eMMC: %s backend not implemented; no hardware access\n",
++		    mido_emmc_stage_name[stage]);
++		return 0;
++	}
++	if (!mido_board_known())
++		return 0;
++	mido_emmc_stage++;
++	return 1;
++}
++
++void
++mido_emmc_init(void)
++{
++	int optin = 0;
++
++	if (!mido_board_known())
++		return;
++	(void)PE_parse_boot_argn("midoemmc", &optin, sizeof(optin));
++	if (optin != 1)
++		return;
++	if (!mido_emmc_enter((enum mido_emmc_stage)MIDO_EMMC_BOARD)) {
++		printf("MIDO eMMC: disabled; no root-on-eMMC backend\n");
++		return;
++	}
++	/* Unreachable until an owned, reversible SDHCI backend is installed. */
++	printf("MIDO eMMC: acceleration unavailable; CPU root unchanged\n");
++}
++
++int
++mido_emmc_root_available(void)
++{
++	return 0;
++}
++#endif

@@ -18,7 +18,7 @@
 volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
 static volatile uint8_t *con_base = (volatile uint8_t *)FB_BASE;
 static int con_w = FB_W, con_h = FB_H;
-static int con_stride = FB_STRIDE, con_bpp = 4;
+static int con_stride = FB_STRIDE, con_bpp = FB_BPP;
 static uint32_t con_bg;
 static int row;
 

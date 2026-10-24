@@ -1,0 +1,79 @@
+diff --git a/bsd/dev/mido_gpu.c b/bsd/dev/mido_gpu.c
+new file mode 100644
+index 0000000..096973f
+--- /dev/null
++++ b/bsd/dev/mido_gpu.c
+@@ -0,0 +1,73 @@
++/*
++ * Redmi Note 4X (mido) Adreno 506 GPU bring-up gate.
++ *
++ * This is NOT a GPU power driver. It deliberately does not map registers or
++ * pass command buffers. Adreno 506 has no driver here; the CPU framebuffer
++ * remains the only display path. Same discipline as polaris 0093.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++extern int mido_board_known(void);
++
++enum mido_gpu_stage {
++	MIDO_GPU_BOARD,
++	MIDO_GPU_FIRMWARE,
++	MIDO_GPU_RAILS,
++	MIDO_GPU_CLOCKS,
++	MIDO_GPU_BUS,
++	MIDO_GPU_PDC,
++	MIDO_GPU_HFI,
++	MIDO_GPU_SMMU,
++	MIDO_GPU_CP,
++	MIDO_GPU_FENCE,
++	MIDO_GPU_STAGE_COUNT
++};
++
++static const char *const mido_gpu_stage_name[MIDO_GPU_STAGE_COUNT] = {
++	"board", "firmware", "rails", "clocks", "bus", "PDC", "HFI", "SMMU",
++	"CP", "fence"
++};
++
++static int mido_gpu_stage = 0;
++
++static int
++mido_gpu_enter(enum mido_gpu_stage stage)
++{
++	if (stage != (enum mido_gpu_stage)mido_gpu_stage ||
++	    stage >= MIDO_GPU_STAGE_COUNT)
++		return 0;
++	if (stage != MIDO_GPU_BOARD) {
++		printf("MIDO GPU: %s backend not implemented; no hardware access\n",
++		    mido_gpu_stage_name[stage]);
++		return 0;
++	}
++	if (!mido_board_known())
++		return 0;
++	mido_gpu_stage++;
++	return 1;
++}
++
++void
++mido_gpu_init(void)
++{
++	int optin = 0;
++
++	if (!mido_board_known())
++		return;
++	(void)PE_parse_boot_argn("midogpu", &optin, sizeof(optin));
++	if (optin != 1 || mido_gpu_stage != MIDO_GPU_BOARD)
++		return;
++	if (!mido_gpu_enter((enum mido_gpu_stage)MIDO_GPU_BOARD)) {
++		printf("MIDO GPU: disabled; CPU display unchanged\n");
++		return;
++	}
++	if (!mido_gpu_enter((enum mido_gpu_stage)MIDO_GPU_FIRMWARE)) {
++		printf("MIDO GPU: disabled; CPU display unchanged\n");
++		return;
++	}
++	printf("MIDO GPU: acceleration unavailable; CPU display unchanged\n");
++}
++#endif

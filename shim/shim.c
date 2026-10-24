@@ -13,13 +13,30 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "emmc.h"
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
 #define PSHOLD			0x0c264000UL
 
+#if defined(MIDO)
+/*
+ * mido / MSM8953 is GIC-400 (GICv2): distributor + CPU interface only. There is
+ * NO redistributor and NO system-register interface, so every ICC_* / GICR
+ * access in the GICv3 test below would UNDEF or fault on this SoC.
+ * Addresses measured from the device DTB:
+ *   /soc/interrupt-controller@b000000  reg <0xb000000 0x2000>, <0xb002000 0x2000>
+ */
+#define GICD_BASE		0x0b000000UL
+#define GICC_BASE		0x0b002000UL
+/* POISON: GICv2 has no redistributor. Address 0 is unmapped, so any MIDO code
+ * path that dereferences this is a bug and should fault loudly, not silently
+ * read the distributor. */
+#define GICR_BASE		0x0UL
+#else
 #define GICD_BASE		0x17a00000UL
 #define GICR_BASE		0x17a60000UL
+#endif
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -467,14 +484,16 @@ static uintptr_t find_gicr(void)
 	return 0;
 }
 
-static void gicd_wait_rwp(void)
+/* GICv3-only helper: unreachable on MIDO (GIC-400), hence the unused hint. */
+static void __attribute__((unused)) gicd_wait_rwp(void)
 {
 	for (int i = 0; i < 1000000 && (rd32(GICD_BASE) & (1U << 31)); i++)
 		;
 }
 
 /* Run one interrupt source for ~300 ms and report what the GIC saw. */
-static void irq_window(const char *label, uintptr_t r, int src)
+/* GICv3-only helper: unreachable on MIDO (GIC-400), hence the unused hint. */
+static void __attribute__((unused)) irq_window(const char *label, uintptr_t r, int src)
 {
 	uint64_t f = rsr("cntfrq_el0");
 	uint32_t pend = 0, act = 0, isr = 0, hppi = 0x3ff, ist = 0;
@@ -527,6 +546,24 @@ static void irq_window(const char *label, uintptr_t r, int src)
 
 static void test_gic(void)
 {
+#if defined(MIDO)
+	/*
+	 * mido is GIC-400 (GICv2). Everything below in the GICv3 path -- ICC_SRE,
+	 * ICC_SGI1R, the redistributor walk -- is invalid here and would fault.
+	 * Identify the controller with reads only and stop: interrupt routing is
+	 * not ours to reconfigure until the eMMC backend exists.
+	 */
+	stage = "gic id";
+	uint32_t ctlr = rd32(GICD_BASE + 0x000);	/* GICD_CTLR  */
+	uint32_t typer = rd32(GICD_BASE + 0x004);	/* GICD_TYPER */
+	uint32_t pidr2 = rd32(GICD_BASE + 0xfe8);	/* GICD_PIDR2 */
+	uint32_t iidr = rd32(GICC_BASE + 0x0fc);	/* GICC_IIDR  */
+	con_hex2("GICD", "ctlr=", ctlr, "typer=", typer);
+	con_hex2("GICv2", "pidr2=", pidr2, "iidr=", iidr);
+	/* GIC-400: PIDR2.ArchRev in bits 7:4 is 0x2; GICC_IIDR low byte 0x02/0x04. */
+	con_str("GIC", "GIC-400 read-only probe (no SRE/GICR on this SoC)");
+	return;
+#else
 	stage = "gic sre";
 	uint64_t sre = rsr("icc_sre_el1");
 	if (!(sre & 1)) {
@@ -585,6 +622,7 @@ static void test_gic(void)
 	irq_window("SGI1", r, SGI_INTID);
 	wr32(r + GICR_ICENABLER0, 0xffffffff);
 	isb();
+#endif /* MIDO */
 }
 
 /* ---- main ---- */
@@ -1238,14 +1276,23 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
-	/* No payload: probe the internal UFS while the MMU is still off. */
-	stage = "ufs";
+	/* No payload: probe the internal storage while the MMU is still off. */
+	stage = "storage";
+#if defined(MIDO)
+	test_emmc();
+	con_skip();
+	/* Keep the probe results on screen; reset after 3 min. */
+	con_str("EMMC", "probe done, reset in ~3 min");
+	delay_ms(180000);
+	reset(20);
+#else
 	test_ufs();
 	con_skip();
 	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
 	con_str("UFS", "probe done, reset in ~3 min");
 	delay_ms(180000);
 	reset(20);
+#endif
 
 	stage = "fill off";
 	uint64_t fill_off = ticks_fill(RED);

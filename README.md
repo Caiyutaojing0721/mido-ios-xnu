@@ -4,6 +4,16 @@
 
 > **实验性 Mi MIX 2S 项目，非日用系统。** 截至 2026-10-23；没有此次更新后的真机测试。
 
+> **2026-10-24 新增：红米 Note 4X（`mido`，骁龙 625 / MSM8953）实验性适配脚手架。**
+> 仅完成 GitHub Actions 内核构建与板级骨架；**尚未在任何 mido 真机启动**，且 mido 用
+> **eMMC 5.1（非 UFS）**，eMMC 根设备后端缺失。板级 MMIO 地址与打包几何已从设备
+> 原厂 `boot.img` 内置 DTB **实测**取得（eMMC 0x07824900、GIC 0x0B000000、
+> framebuffer 0x90001000），不再是猜测值。
+> 另用一份**在红米 4X（`santoni`/MSM8940，同为 eMMC）上确实能引导 iOS** 的镜像做了
+> 交叉校准：修正了 3 个会让内核静默不工作的匹配串（`qcom,kryo470`、`sweet,display`、
+> 节点名 `sweet-fbcon`），并据其 eMMC 驱动行为生成了可直接 `fastboot boot` 的 mido
+> 实验镜像（未验证）。详见 [docs/MIDO.md](<docs/MIDO.md>) 1.3–1.5 节。
+
 ## 简体中文
 
 ### MIX 2S 实现和证据
@@ -47,6 +57,17 @@ python -m unittest tools/test_polaris_cpu_topology.py tools/test_polaris_gpu_pre
 仓库不上传 Apple 镜像、Qualcomm 固件、设备转储、序列号或分区备份。对 `userdata` 写入会清除现有数据；新的临时启动与任何分区写入均须事先分别确认，保留 bootloader、recovery、modem、persist 和备份。
 
 ## English
+
+> **2026-10-24 — new: experimental Redmi Note 4X (`mido`, Snapdragon 625 / MSM8953)
+> scaffold.** CI kernel build and board skeleton only; **not booted on any mido
+> device**, and mido uses **eMMC 5.1 (not UFS)**, so the root-on-eMMC backend is
+> missing. Board MMIO and boot-image geometry are now **measured** from the
+> device's own `boot.img` DTB (eMMC 0x07824900, GIC 0x0B000000, framebuffer
+> 0x90001000) instead of guessed. A known-booting **Redmi 4X (`santoni`/MSM8940,
+> also eMMC)** image was used as a cross-check: three silent-failure match strings
+> were fixed (`qcom,kryo470`, `sweet,display`, node name `sweet-fbcon`) and a
+> boot-only mido experiment image was produced from its eMMC driver behaviour
+> (unverified). See [docs/MIDO.md](<docs/MIDO.md>) sections 1.3-1.5.
 
 ### Mi MIX 2S implementation (2026-10-23)
 

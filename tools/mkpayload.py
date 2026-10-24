@@ -36,6 +36,15 @@ PAGE = 0x4000
 BOOT_LINE_LENGTH = 608
 CMDLINE = 0x48
 SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x2a8
+# Redmi Note 4X (mido, MSM8953) default bring-up command line. rd=emmcroot0 is
+# a PLACEHOLDER: there is no root-on-eMMC backend yet (see docs/MIDO.md) and
+# mido_emmc is a disabled gate, so this will not mount a root filesystem. Start
+# with cpus=4 (all 8 A53 are homogeneous; raise to 8 only after PSCI is proven).
+MIDO_CMDLINE = ('debug=0xc serial=3 cpus=4 keepsyms=1 -enable_kprintf_spam '
+                '-noprogress mido=1 midofb=1 sweetfb_mido=1 sweetfb_hz=30 '
+                'sweettouch=0 sweetkeys=0 midogpu=0 midoemmc=0 wdt=-1 '
+                'rd=emmcroot0 unentitled_ios_sim_launch=1 ignition_level=1 '
+                'wdt_test=no_user_checkin')
 
 
 def parse_macho(buf):
@@ -217,6 +226,10 @@ if __name__ == '__main__':
                     help='fail if payload bytes exceed the bootloader ramdisk-to-DTB gap')
     ap.add_argument('--check-polaris-cpus', action='store_true',
                     help='require Polaris/SDM845 eight-node ADT and one contiguous cpus=1..8 prefix')
+    ap.add_argument('--mido', action='store_true',
+                    help='use the Redmi Note 4X (mido) default command line if --cmdline is unchanged')
+    ap.add_argument('--check-mido-cpus', action='store_true',
+                    help='require mido/MSM8953 eight A53 nodes and one contiguous cpus=1..8 prefix')
     a = ap.parse_args()
     if a.check_polaris_cpus:
         from polaris_cpu_topology import TopologyError, validate
@@ -226,6 +239,16 @@ if __name__ == '__main__':
         except (TopologyError, ValueError, IndexError, struct.error) as exc:
             ap.error(f'Polaris CPU topology: {exc}')
         print(f'Polaris CPU prefix {selected}/8 validated (CPU_ON not verified)')
+    if a.mido and a.cmdline == 'debug=0xc serial=3 cpus=1 keepsyms=1':
+        a.cmdline = MIDO_CMDLINE
+    if a.check_mido_cpus:
+        from mido_cpu_topology import TopologyError, validate as mido_validate
+        try:
+            with open(a.adt, 'rb') as source:
+                selected = mido_validate(source.read(), a.cmdline)
+        except (TopologyError, ValueError, IndexError, struct.error) as exc:
+            ap.error(f'mido CPU topology: {exc}')
+        print(f'mido CPU prefix {selected}/8 validated (CPU_ON not verified)')
     blobs = []
     for item in a.blob:
         if '=' not in item:

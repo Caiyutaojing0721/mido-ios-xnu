@@ -1,0 +1,31 @@
+/*
+ * Redmi Note 4X (mido, MSM8953) board predicate.
+ *
+ * This is NOT a driver. It answers "are we on mido?" from the boot-arg
+ * tuple, so other board-gated code (display scaling, eMMC root, GPU) can
+ * opt in. No hardware access. Scaffold for the bring-up; see docs/MIDO.md.
+ */
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <pexpert/pexpert.h>
+
+static int mido_optin = 0;
+
+int
+mido_board_known(void)
+{
+	if (mido_optin)
+		return 1;
+	(void)PE_parse_boot_argn("mido", &mido_optin, sizeof(mido_optin));
+	return mido_optin == 1;
+}
+
+void
+mido_board_init(void)
+{
+	if (!mido_board_known())
+		return;
+	printf("MIDO: board recognised (MSM8953 bring-up scaffold)\n");
+}
+#endif
