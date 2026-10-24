@@ -424,6 +424,36 @@ tools/check_fbcon_block.py    # 把改完的 fbcon 块用 zig cc -target aarch64
 
 `.github/workflows/xnu-mido.yml` 已把 `0096-*.patch` 与 `0095-*` 一起拷进 `dxb/patches/`。
 
+#### 1.6.5 第一份自建内核镜像（CI 产物 → boot.img）
+
+`xnu-mido` 跑通后（`kernel.development.sweet`，17,256,872 B，
+`30e542a7fcb00ee2c974b5bfc025c1b06ee07fa22771997fda95887e296e75e1`），
+**0096 是否真的进了内核可以直接验**：`buildtree` 产物里有打过补丁的源码树，
+把 `xnu/pexpert/arm/pe_serial.c` 抽出来就能看到 `fbcon_bpp` / `fbcon_pixels` / `fbcon_put`
+与 `SecureDTGetProperty(entry, "depth", …)`。这比拿真机试要便宜得多。
+
+打包（结果覆盖 `out/shim-mido-xnu-gz.img`，旧的 santoni 版先改名留档）：
+
+```sh
+python3 tools/mkadt_mido.py out/mido.adt --canvas panel --fb-depth 24
+python3 tools/mkpayload.py xnu/out-mido/kernel.development.sweet out/mido.adt \
+    out/mido-payload.bin --mido --check-mido-cpus
+PLATFORM=mido MIDO_KERNEL_GZIP=1 shim/build.sh out/mido-payload.bin
+```
+
+成品核对过四项（`tools/mido_dtb.py` + 直接读 header）：
+
+| 项 | 值 |
+| --- | --- |
+| boot header | v0 / page 2048 / kernel `0x80008000` / ramdisk `0x81000000` / tags `0x80000100` / os_version `0x1e000191` |
+| kernel blob | gzip 流 15,157 B + stock DTB 247,356 B（FDT 落在 `0x3335`，`msm-id 0x125` / `board-id 0xb`，与 stock **逐字节相同**） |
+| ramdisk | payload 16,646,064 B，`SWEETXNU` v1，`phys_base 0x98000000` / `mem_size 0x28000000`，内嵌 ADT 10,764 B（与 `out/mido.adt` 相同） |
+| 全文件 | `out/shim-mido-xnu-gz.img` 16,910,336 B，`3b0cb47b6fb560bed9277b240e66233a38a93eec3e11fa2d0f1f857eceb19864` |
+
+> 注意自建内核的链接基址是 `0xfffffe0006000000`（santoni 那份是 `0xfffffff006000000`）。
+> shim 全程用 payload 头里的 `virt_base` / `entry` / `phys_base` 现算 `pa = va + (phys_base - virt_base)`，
+> 没有写死任何基址，所以这个差异不影响启动。
+
 ## 2. 交付物一览
 
 ```
