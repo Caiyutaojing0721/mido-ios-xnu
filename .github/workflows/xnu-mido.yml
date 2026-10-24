@@ -64,11 +64,15 @@ jobs:
           # mido-only patches. 0095-* create bsd/dev/mido_*.c as new files and
           # always apply. 0096-* rewrites the fbcon block that 0003 adds (so it
           # must land after 0012, which patches inside that same block) and
-          # teaches it the 24bpp/24-bit splash pitch mido uses. The
+          # teaches it the 24bpp/24-bit splash pitch mido uses. 0097-* repoints
+          # the SWEET bootstrap console (start.s block mapping + sweet_early.c)
+          # from polaris' 0x9c000000/32bpp to mido's 0x90001000/24bpp. All of
+          # them sort after the shared patches, which is required. The
           # context-based display patch (0094) is applied MANUALLY against the
           # xnu tree (see docs/MIDO.md); it is deliberately NOT auto-applied.
           cp xnu/patches-mido/0095-*.patch dxb/patches/ 2>/dev/null || true
           cp xnu/patches-mido/0096-*.patch dxb/patches/ 2>/dev/null || true
+          cp xnu/patches-mido/0097-*.patch dxb/patches/ 2>/dev/null || true
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh

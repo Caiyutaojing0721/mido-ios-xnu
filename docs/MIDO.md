@@ -454,6 +454,60 @@ PLATFORM=mido MIDO_KERNEL_GZIP=1 shim/build.sh out/mido-payload.bin
 > shim 全程用 payload 头里的 `virt_base` / `entry` / `phys_base` 现算 `pa = va + (phys_base - virt_base)`，
 > 没有写死任何基址，所以这个差异不影响启动。
 
+#### 1.6.6 首次自建内核上机：跳到 XNU 后静默卡死（`0097`）
+
+现象：shim 打印到 `XNU jumping (fbcon clears screen)` 就停住，屏幕定格在 shim 的蓝底白字，
+没有 PANIC，也不会自己重启。
+
+**先看照片里的一个细节**：底部左侧有一块淡色小方块。那是 `start.s` 里 `start_first_cpu` 的
+stage 0 白带——它不建栈、不建页表、**在 MMU 关闭状态下直接用 `boot_args` 里的 `Video.v_baseAddr`
+往物理地址写 32 行 × 64 像素**（`ldr x0,[x20,#40]`、`madd x0,x2,x4,x0`）。
+所以：
+
+* 白带存在 ⇒ 内核**确实开始执行了**（`_start` → `start_first_cpu`），不是跳错地址；
+* 但 `vstart()` 的第一句 `sweet_early_mark(1, "arm_init entered (MMU on)")` 什么都没留下
+  ⇒ 死在 stage 0 与 `arm_init` 之间。
+
+这一段只有几步：设 `VBAR_EL1 = LowExceptionVectorBase`、读 boot_args、建 bootstrap 页表、开 MMU、
+`b common_start`。而 `LowExceptionVectorBase` 的向量全是 `b .`——**一旦开 MMU 之后发生异常，
+就是原地死循环，屏幕不动、没有 panic**，和观察完全吻合。
+
+根因在 bootstrap 页表里这一行（共享补丁 `0083` 加的）：
+
+```asm
+#if defined(SWEET)
+	MOV64	x10, 0x9c000000      /* sweet 的开屏缓冲 */
+	...
+	str		x11, [x13, x12, lsl #TTE_SHIFT]
+#endif
+```
+
+它只给 `0x9c000000`（sweet）建了 Normal-NC 块映射。mido 的开屏缓冲在 **`0x90001000`**，没有映射，
+于是 MMU 一开，`sweet_early_mark(1)` 写这个 VA 就翻译失败 → 异常 → `b .` 死循环。
+
+`0097-mido-early-console.patch` 修两处：
+
+| 文件 | 改动 | 作用 |
+| --- | --- | --- |
+| `osfmk/arm64/start.s` | `MOV64 x10, 0x9c000000` → `0x90000000` | 给 mido 的开屏建 32MB 块映射（覆盖 `0x90001000`+`0x5EEC00`）|
+| `osfmk/arm64/sweet_early.c` | `early_fb` 改 `uint8_t *`；新增 `sweet_early_put()` 3/4 字节分支；`early_bpp` 从 `Video.v_depth/8` 取；几何门槛 `v_rowBytes >= v_width * 4` → `* early_bpp` | 早期控制台按 24bpp 逐字节画，几何真正跟随 boot_args |
+
+`0x90000000` 的块号是 `0x48`，而 V=P 的 RAM 从 `physBase=0x99004000`（块号 `0x4C`）起，两者不冲突。
+
+验证方式（这套流程以后每次都该走，比上机快）：
+
+```sh
+# 1) 从产物里抽出打过补丁的源码，确认真进去了
+tar -xzOf xnu/out-mido/buildtree.tgz xnu/osfmk/arm64/start.s | grep -n "MOV64.*0x90000000"
+# 2) 合成树里回放补丁，逐字节比对
+git apply --check xnu/patches-mido/0097-mido-early-console.patch
+# 3) C 部分用 stub 头单独编一遍
+zig cc -target aarch64-freestanding -c sweet_early.c
+```
+
+修好后的预期：屏幕会按 24bpp 正常显示 `SWEET EARLY 01: arm_init entered (MMU on)` 到
+`SWEET EARLY 20: kprintf startup complete` 这条链，卡在哪一步一眼就能看出来。
+
 ## 2. 交付物一览
 
 ```
@@ -470,6 +524,7 @@ xnu/patches-mido/0095-mido_board.patch             # bsd/dev/mido_board.c（板�
 xnu/patches-mido/0095-mido_emmc.patch              # bsd/dev/mido_emmc.c（eMMC 门禁 stub）
 xnu/patches-mido/0095-mido_gpu.patch               # bsd/dev/mido_gpu.c（Adreno 506 门禁 stub）
 xnu/patches-mido/0096-mido-fbcon-24bpp.patch       # fbcon 读 ADT depth、支持 24bpp 绘制（自建内核用）
+xnu/patches-mido/0097-mido-early-console.patch     # 引导期控制台：映射 mido 开屏、按 24bpp 画
 xnu/patches-mido/src/                  # 上述 .c 的参考源（patch 由它生成）
 xnu/patches-mido/mido-hook.sh          # 把 mido 驱动接入 conf/files 与初始化的本地脚本
 shim/emmc.c shim/emmc.h                # 只读 eMMC/SDHCI 探针

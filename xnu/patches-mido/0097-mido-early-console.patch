@@ -1,0 +1,151 @@
+mido: bring the bootstrap console up on the mido panel
+
+The SWEET bootstrap path assumes the splash framebuffer lives at
+0x9c000000 (sweet) and is 32bpp.  mido's panel is at 0x90001000 and is
+byte-packed BGR888, 3240 bytes per row, so on the first boot the kernel
+drew the stage-0 white band (that one runs with the MMU off, straight
+through the physical address) and then died:
+
+  * start.s only mapped 0x9c000000 as a Normal-NC block, so once the MMU
+    came on, sweet_early_mark(1) wrote to an unmapped VA.  VBAR_EL1 had
+    just been pointed at LowExceptionVectorBase, whose vectors are plain
+    "b ." loops, so the fault spun forever with the screen frozen.
+
+  * even if it had been mapped, sweet_early_init() refused the mido
+    geometry (it required v_rowBytes >= v_width * 4) and every pixel was
+    stored as a 32-bit word into a 24bpp buffer, so the text would have
+    been unreadable.
+
+Fix both: map 0x90000000 (32MB aligned, covers the whole splash) instead
+of 0x9c000000, and make the early console byte-addressed with
+early_bpp taken from boot_args Video.v_depth.
+
+This is a mido-only patch: xnu-mido.yml builds a separate kernel and the
+shared xnu.yml build never sees xnu/patches-mido/.
+
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 206d448..e29d42b 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -698,7 +698,7 @@ Lkernelcache_base_found:
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, 0x90000000
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index f0820fd..81f2f7e 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,8 +11,9 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+-static unsigned int early_width = 1080, early_height = 2400, early_stride = 1080;
++static volatile uint8_t *early_fb = (volatile uint8_t *)(uintptr_t)0x90001000;
++static unsigned int early_width = 1080, early_height = 1920;
++static unsigned int early_stride = 3240, early_bpp = 3;
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH early_width
+ #define EARLY_HEIGHT early_height
+@@ -25,6 +26,25 @@ static unsigned int early_width = 1080, early_height = 2400, early_stride = 1080
+ 
+ extern unsigned char iso_font[256 * 16];
+ 
++/*
++ * The mido splash is byte-packed BGR888: three bytes per pixel, 3240 per row.
++ * EARLY_STRIDE is a byte count, not a count of 32-bit words as on sweet.
++ */
++static void
++sweet_early_put(unsigned int x, unsigned int y, uint32_t color)
++{
++	volatile uint8_t *p = EARLY_FB + (uintptr_t)y * EARLY_STRIDE +
++	    (uintptr_t)x * early_bpp;
++
++	if (early_bpp == 4) {
++		*(volatile uint32_t *)p = color;
++	} else {
++		p[0] = (uint8_t)color;
++		p[1] = (uint8_t)(color >> 8);
++		p[2] = (uint8_t)(color >> 16);
++	}
++}
++
+ /* Initialized data must remain writable until disable, including panics. */
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
+@@ -38,13 +58,18 @@ void
+ sweet_early_init(const boot_args *args)
+ {
+ 	if (args != NULL && args->Video.v_baseAddr != 0) {
+-		early_fb = (volatile uint32_t *)(uintptr_t)args->Video.v_baseAddr;
++		early_fb = (volatile uint8_t *)(uintptr_t)args->Video.v_baseAddr;
++	}
++	if (args != NULL && args->Video.v_depth == 24) {
++		early_bpp = 3;
++	} else if (args != NULL && args->Video.v_depth == 32) {
++		early_bpp = 4;
+ 	}
+ 	if (args != NULL && args->Video.v_width != 0 && args->Video.v_height != 0 &&
+-	    args->Video.v_rowBytes >= args->Video.v_width * 4) {
++	    args->Video.v_rowBytes >= args->Video.v_width * early_bpp) {
+ 		early_width = (unsigned int)args->Video.v_width;
+ 		early_height = (unsigned int)args->Video.v_height;
+-		early_stride = (unsigned int)(args->Video.v_rowBytes / 4);
++		early_stride = (unsigned int)args->Video.v_rowBytes;
+ 	}
+ }
+ 
+@@ -52,9 +77,10 @@ static void
+ sweet_early_clear_row(void)
+ {
+ 	for (unsigned int y = 0; y < EARLY_CELL_H; y++) {
+-		volatile uint32_t *line = EARLY_FB + (early_row * EARLY_CELL_H + y) * EARLY_STRIDE;
++		unsigned int row = early_row * EARLY_CELL_H + y;
++
+ 		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
+-			line[x] = 0xff000000u;
++			sweet_early_put(x, row, 0xff000000u);
+ 		}
+ 	}
+ }
+@@ -84,13 +110,13 @@ sweet_early_putc(char c)
+ 	const unsigned char *glyph = iso_font + (unsigned char)c * 16;
+ 	for (unsigned int gy = 0; gy < 16; gy++) {
+ 		for (unsigned int sy = 0; sy < EARLY_SCALE; sy++) {
+-			volatile uint32_t *line = EARLY_FB +
+-			    (early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy) * EARLY_STRIDE +
+-			    early_col * EARLY_CELL_W;
++			unsigned int row = early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy;
++
+ 			for (unsigned int gx = 0; gx < 8; gx++) {
+ 				uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
+ 				for (unsigned int sx = 0; sx < EARLY_SCALE; sx++) {
+-					line[gx * EARLY_SCALE + sx] = pixel;
++					sweet_early_put(early_col * EARLY_CELL_W +
++					    gx * EARLY_SCALE + sx, row, pixel);
+ 				}
+ 			}
+ 		}
+@@ -115,7 +141,7 @@ sweet_early_mark(unsigned int stage, const char *label)
+ 	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+ 	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+ 		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
+-			EARLY_FB[y * EARLY_STRIDE + x] = color;
++			sweet_early_put(x, y, color);
+ 		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -149,7 +175,7 @@ void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	early_fb = (volatile uint8_t *)(uintptr_t)base;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
