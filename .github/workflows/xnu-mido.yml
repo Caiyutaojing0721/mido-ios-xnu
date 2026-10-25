@@ -87,6 +87,13 @@ jobs:
           cp xnu/patches-mido/0100-*.patch dxb/patches/ 2>/dev/null || true
           cp xnu/patches-mido/0101-*.patch dxb/patches/ 2>/dev/null || true
           cp xnu/patches-mido/0102-*.patch dxb/patches/ 2>/dev/null || true
+          # 0102-* moves the port to 4KB pages (the only granule a Cortex-A53
+          # has).  0103-* follows up on the two macOS address-space assumptions
+          # that 4KB then exposes: the arm64 user-VA cap (128TB -> 63GB, which
+          # is what pmap's commpage assert and T0SZ=25 can actually describe)
+          # and PAGE_SHIFT_CONST (stock XNU advertises 16KB for any device with
+          # more than 1GB of RAM, which would contradict the 4KB tables).
+          cp xnu/patches-mido/0103-*.patch dxb/patches/ 2>/dev/null || true
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh

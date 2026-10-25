@@ -1,0 +1,102 @@
+mido: iOS user-VA cap and a fixed 4KB kernel page size
+
+0102 switched the port to 4KB pages -- the only granule a Cortex-A53 has -- and
+the next CI run died in pmap.c:
+
+    error: static assertion failed: ((0x0000000FFFFFC000ULL) & ~0x000000003fffffffULL) >= ((mach_vm_offset_t) 0x00007FFFFE000000ULL)
+    static_assert((_COMM_PAGE64_BASE_ADDRESS & ~ARM_TT_L1_OFFMASK) >= MACH_VM_MAX_ADDRESS);
+
+Both offenders are address-space assumptions inherited from the macOS host
+build, not from the hardware.
+
+  * osfmk/mach/arm/vm_param.h: MACH_VM_MAX_ADDRESS_RAW comes out as the macOS
+    128TB value because dxb builds with PLATFORM=MacOSX, and the header keys
+    that choice off `XNU_PLATFORM_MacOSX`.  The assert above only exists in the
+    ARM_PGSHIFT == 12 branch, and it wants the comm page (64GB - 16KB) nested
+    above user space; iOS manages that by capping user VA at 63GB
+    (_COMM_PAGE64_NESTING_START).  128TB is unreachable here anyway: 4KB pages
+    give T0SZ = 25, i.e. 512GB.  Use the iOS value unconditionally; the block
+    is arm64-only, so the x86_64 kernels built in the same run are unaffected.
+
+  * osfmk/arm/arm_init.c: PAGE_SHIFT_CONST is picked at runtime, and stock XNU
+    advertises 16KB on any arm64 device with more than 1GB of RAM.  That is
+    harmless when the kernel is compiled with __ARM_16K_PG__, because PAGE_SHIFT
+    is then pinned to ARM_PGSHIFT, but mido is now a 4KB build and PAGE_SHIFT
+    follows the variable.  On a 3GB phone PAGE_SIZE would read 16384 while
+    ARM_PGBYTES is 4096, and every index, offset and rounding in the pmap would
+    be wrong.  Pin PAGE_SHIFT_CONST to ARM_PGSHIFT.
+
+No device register and no panel behaviour changes here.  Together with 0102 the
+build should clear pmap.c, and the 0099/0100/0101 breadcrumbs should be followed
+by the 0098 early console instead of silence.
+
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index ddae366..4aef58b 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -400,20 +400,19 @@ arm_init(
+ 		/*
+ 		 * Select the advertised kernel page size.
+ 		 */
+-		if (args->memSize > 1ULL * 1024 * 1024 * 1024) {
+-			/*
+-			 * arm64 device with > 1GB of RAM:
+-			 * kernel uses 16KB pages.
+-			 */
+-			PAGE_SHIFT_CONST = PAGE_MAX_SHIFT;
+-		} else {
+-			/*
+-			 * arm64 device with <= 1GB of RAM:
+-			 * kernel uses hardware page size
+-			 * (4KB for H6/H7, 16KB for H8+).
+-			 */
+-			PAGE_SHIFT_CONST = ARM_PGSHIFT;
+-		}
++		/*
++		 * mido: always advertise the granule the kernel was compiled for.
++		 *
++		 * Stock XNU reports 16KB on every arm64 device with more than 1GB of
++		 * RAM, which is safe only because every Apple arm64 SoC implements a
++		 * 16KB granule (and those builds pin PAGE_SHIFT to ARM_PGSHIFT through
++		 * __ARM_16K_PG__).  mido has neither: the Cortex-A53 has no TGran16, so
++		 * the kernel is compiled for 4KB tables and PAGE_SHIFT follows this
++		 * variable.  Reporting 16KB here would make PAGE_SIZE (16384) disagree
++		 * with ARM_PGBYTES (4096) and poison every page-table index, offset and
++		 * rounding operation.
++		 */
++		PAGE_SHIFT_CONST = ARM_PGSHIFT;
+ 
+ 		/* 32-bit apps always see 16KB page size */
+ 		page_shift_user32 = PAGE_MAX_SHIFT;
+diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+index c013288..e032447 100644
+--- a/osfmk/mach/arm/vm_param.h
++++ b/osfmk/mach/arm/vm_param.h
+@@ -133,11 +133,23 @@ extern int PAGE_SHIFT_CONST;
+ 
+ /* system-wide values */
+ #define MACH_VM_MIN_ADDRESS_RAW 0x0ULL
+-#if defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)
+-#define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+-#else
++/*
++ * mido: keep the iOS cap even though dxb builds with PLATFORM=MacOSX.
++ *
++ * The macOS value (0x00007FFFFE000000, a 47-bit / 128TB user VA) is only
++ * describable through a 47-bit TTBR0.  This port runs 4KB pages, so TCR_EL1
++ * T0SZ = 25 and user space ends at 512GB; worse, pmap.c asserts -- in its
++ * ARM_PGSHIFT == 12 branch only -- that the comm page nests above the maximum
++ * user VA, and with the macOS cap that assertion cannot hold:
++ *
++ *   (_COMM_PAGE64_BASE_ADDRESS & ~ARM_TT_L1_OFFMASK) >= MACH_VM_MAX_ADDRESS
++ *   (63GB)                                           >= (128TB)   -- false
++ *
++ * iOS satisfies it by capping user space at _COMM_PAGE64_NESTING_START
++ * (0x0000000FC0000000 == 63GB) and putting the comm page at 64GB - 16KB.
++ * Keep that value for every arm64 kernel built here.
++ */
+ #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
+-#endif
+ 
+ #define MACH_VM_MIN_ADDRESS     ((mach_vm_offset_t) MACH_VM_MIN_ADDRESS_RAW)
+ #define MACH_VM_MAX_ADDRESS     ((mach_vm_offset_t) MACH_VM_MAX_ADDRESS_RAW)
