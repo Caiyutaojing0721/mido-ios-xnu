@@ -109,11 +109,18 @@ def main():
         bad = 0
         for i in range(16):
             off = i * 0x80
-            if off + 4 > len(raw):
+            if off + 8 > len(raw):
                 print('  slot %2d: beyond end of text' % i)
                 bad += 1
                 continue
-            w = struct.unpack_from('<I', raw, off)[0]
+            # slot must be:  mov x9, #i   (movz w9/w9 wide) ; b painter
+            w0 = struct.unpack_from('<I', raw, off)[0]
+            w = struct.unpack_from('<I', raw, off + 4)[0]
+            movz_ok = ((w0 & 0xFFE0001F) == 0xD2800009
+                       and ((w0 >> 5) & 0xFFFF) == i)
+            if not movz_ok:
+                print('  slot %2d: expected "mov x9,#%d", got %#010x' % (i, i, w0))
+                bad += 1
             # b <label>: 000101 imm26
             if (w >> 26) != 0b000101:
                 print('  slot %2d: not a b instruction (%#x)' % (i, w))
@@ -122,7 +129,7 @@ def main():
                 imm = w & 0x3FFFFFF
                 if imm & (1 << 25):
                     imm -= (1 << 26)
-                target = off + imm * 4
+                target = off + 4 + imm * 4
                 if not (0 <= target < len(raw)):
                     print('  slot %2d: branch out of range -> %d' % (i, target))
                     bad += 1

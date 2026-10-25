@@ -597,17 +597,37 @@ MMU 的另一侧。
 * **`SCTLR_EL1_DEFAULT` 不含 `WXN`，`ARM_TTE_BOOT_BLOCK` 不含 `PXN`**，所以 MMU 打开后
   继续执行 V=P 映射里的代码不会取指异常。
 
-`0099-mido-mmu-trace.patch` 因此改三处：
+**又一条反证：MMU 前后那段指令在两个内核里几乎逐条相同。** 反汇编比对
+`out/santoni/xnu_flat.bin`（能跑到 `vm_page_bootstrap` 的参考内核）和自建 mido 内核的
+`msr mair_el1` → `msr sctlr_el1` 窗口：
+
+* 写入的 `SCTLR_EL1` 值**完全相同**，都是 `0x3454593D`；
+* `MAIR_EL1` 的构造序列、`tlbi vmalle1` / `ic iallu` / `dsb sy` / `isb` 冲刷序列完全相同；
+* `VBAR_EL1 = adrp(vectors) + x22 - x23`（物理地址）的写法相同；
+* 唯一的结构差异是 **granule**：santoni 用 4K（`TTBR1 = x25 + 0x1000`，块 2MB，L2 索引
+  右移 21），mido 用 16K（`TTBR1 = x25 + 0x4000`，块 32MB，索引右移 25）。
+
+因此 SCTLR 的 RES0 位、16K granule 支持、MAIR 属性这些“可疑点”都不是差异来源——两个
+内核写的是同一个常量，跑在同一种核（Cortex-A53）上。
+
+`0099-mido-mmu-trace.patch` 因此改四处：
 
 1. **把 splash 的 V=P 映射加回来**（一个 32MB Normal-NC block，写进已有的 V=P L2 表，
-   `add x13, x25, #(2 * PGBYTES)`）。这是下面两项成立的前提。
+   `add x13, x25, #(2 * PGBYTES)`）。这是下面几项成立的前提。
 2. **第 4 个进度块（洋红）紧跟在 `MSR SCTLR_EL1` + `isb` 之后**。它仍然是物理写：只有
    MMU 真的开了、V=P 映射真的有效，它才会出现在屏幕上。
-3. **16 个 low vector 槽位全部跳到一个“画红块然后停住”的处理程序**。该程序不用栈、
-   不读 `boot_args`，几何全部写死（`0x90001000 + (1920-32)*3240 + 512*3 = 0x905D7080`），
-   所以 MMU 开或关都有效。以前“静默死机”和“异常”长得一模一样，现在异常会留下红块。
+3. **第 5 个进度块（青）在 `ret` 之前**（`cbnz x21, Ltrampoline` 之后的返回序列里），
+   把 `CPACR_EL1`、`TPIDR_EL1`、`MIDR_EL1` 三条也覆盖进来——如果 `CPACR_EL1` 写到
+   EL2/EL3 被拦，青块就不会出现。
+4. **16 个 low vector 槽位带着自己的编号跳进 painter**（`mov x9, #n`）。painter 不用栈、
+   不读 `boot_args`，几何全部写死，所以 MMU 开或关都有效。它画两条带：
+   * `0x905BD200`（第 1856–1887 行）：第 `n` 块位置画红，**哪一块亮就是哪个向量触发**
+     （0–3 = EL1/SP0，4–7 = EL1/SP1，8–11 = EL0 aarch64，12–15 = EL0 aarch32；
+     每 4 个内部依次是 sync / irq / fiq / serror）。
+   * `0x905A3D00`（第 1824–1855 行）：`ESR_EL1.EC`，**列 = EC & 0xF，颜色 = EC >> 4**
+     （红 0 / 绿 1 / 蓝 2）。EC=0x21 取指异常、0x25 数据异常、0x26 SP 对齐、0x0E 非法执行态。
 
-底部一行从左到右：白、绿（+128px）、黄（+256px）、洋红（+384px）、红（+512px）。
+底部一行从左到右：白、绿（+384B）、黄（+768B）、洋红（+1152B）、青（+1536B）。
 
 | 看到的颜色 | 含义 |
 | --- | --- |
@@ -615,8 +635,8 @@ MMU 的另一侧。
 | 白 + 绿 | 开 MMU / 跳 `arm_init` 之间出错 |
 | 白 + 绿 + 黄 | `MSR SCTLR_EL1` 或紧随的 `isb` 就出错 |
 | 白 + 绿 + 黄 + 洋红 | **MMU 已开且 V=P 有效**，问题在其后 |
-| 再加一块红 | 确实发生了异常（而且向量表可执行、painter 能写屏）|
-| 只有白绿黄 + 红 | MMU 一开就异常，但向量表还能跑（说明 V=P 映射部分可用）|
+| 再加青 | 一路活到返回 C 之前，问题在 `ret` 之后的 KVA 上 |
+| 上面出现红块 | 发生了异常，块的位置 = 向量号；再上一带 = `ESR_EL1.EC` |
 
 验证（都在仓库根目录跑）：
 
@@ -638,7 +658,7 @@ tools/mkpatch_mido_fbcon.py             # 生成 0096：合成树回放 0003→0
 tools/check_fbcon_block.py              # 把 fbcon 块单独用 zig cc -target aarch64-freestanding 编一遍
 tools/mkpatch_mido_early.py             # 生成 0098：合成树导出 diff + 逐字节回放
 tools/check_early_asm.py                # 把 start.s 里两段进度块单独汇编
-tools/mkpatch_mido_mmu_trace.py         # 生成 0099：splash V=P 映射 + 洋红块 + 异常 painter
+tools/mkpatch_mido_mmu_trace.py         # 生成 0099：splash V=P 映射 + 洋红/青块 + 带编号的异常 painter
 tools/check_mmu_trace_asm.py            # 单独汇编向量表/painter，校验 16 个槽位可跳
 xnu/patches-mido/0094-mido-display-scaling.patch   # iPhone X 画布按高度缩放进 1080×1920
 xnu/patches-mido/0095-mido_board.patch             # bsd/dev/mido_board.c（板型判定）

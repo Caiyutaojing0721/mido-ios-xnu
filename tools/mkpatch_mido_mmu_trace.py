@@ -17,15 +17,20 @@ This patch restores the observation path across the MMU boundary:
     isb, still through the physical address.  It can only appear if the MMU
     came up and the V=P mapping is real.
 
-  * the sixteen low vector slots jump to a stack-free painter that fills a red
-    block at a fixed spot and halts.  It uses compile-time mido geometry, so it
-    works with the MMU on and off.  A red block means "an exception happened",
-    which was previously invisible.
+  * a fifth breadcrumb (cyan) is drawn just before the boot CPU returns into C,
+    so CPACR_EL1/TPIDR_EL1/MIDR_EL1 are covered too.
 
-Reading the panel:
-    white + green + yellow            SCTLR_EL1 or the isb faults
-    white + green + yellow + magenta  MMU is up; the fault is past it
-    ... + red                         an exception was taken (see x position)
+  * the sixteen low vector slots jump to a stack-free painter that fills a red
+    block and halts.  Each slot passes its own index in x9, and the painter
+    also decodes ESR_EL1.EC, so one faulting boot reports both "which vector"
+    and "which exception class" as block positions on two extra bands.
+
+Reading the panel (bottom band = breadcrumbs, two bands above it = fault info):
+    white + green + yellow                SCTLR_EL1 or the isb faults
+    ... + magenta                         the MMU is up, V=P works
+    ... + cyan                            everything up to the return is fine
+    a red block in the x9 band            that vector slot fired
+    a block in the ESR band               column = EC & 0xF, colour = EC >> 4
 
 Run from the repository root.
 """
@@ -109,39 +114,78 @@ def crumb(x_dwords, color, what):
 
 # The low-vector painter. Fixed geometry for mido so it needs neither a stack
 # nor boot_args:
-#   base 0x90001000, 1080x1920, 24bpp, stride 3240
-#   row   = base + (1920 - 32) * 3240 = 0x905D6A80
-#   x=512 px -> +512*3 = 1536 bytes -> 0x905D7080
+#   base 0x90001000, 1080x1920, 24bpp, stride 3240 (810 dwords per row)
+#   a block is 48 dwords (192 bytes = 64px) wide and 32 rows tall
+#   band for "which vector slot fired":  y = 1920-64  -> 0x905BD200
+#   band for "what does ESR_EL1 say":    y = 1920-96  -> 0x905A3D00
+# The screen is RGB888: value = R | G<<8 | B<<16.
 PAINTER = [
     '',
     '/*',
-    ' * Paint a red block and halt. All sixteen low vector slots land here.',
+    ' * Exception painter. All sixteen low vector slots land here with the slot',
+    ' * number in x9.',
     ' *',
     ' * No stack, no boot_args, no C: this may run before or after the MMU is',
     ' * enabled, so everything is a compile-time constant for the mido panel',
-    ' * (1080x1920, stride 3240 bytes, 24bpp):',
+    ' * (1080x1920, stride 3240 bytes, 24bpp). It paints two bands:',
     ' *',
-    ' *     0x90001000 + (1920 - 32) * 3240 + 512 * 3 = 0x905D7080',
+    ' *   band 1 (0x905BD200, rows 1856..1887): one block at x = slot * 64px,',
+    ' *           always red. Which block lights up says which entry of the',
+    ' *           vector table fired:',
+    ' *               0-3   EL1, SP_EL0   (sync, irq, fiq, serror)',
+    ' *               4-7   EL1, SP_EL1',
+    ' *               8-11  EL0, aarch64',
+    ' *               12-15 EL0, aarch32',
+    ' *',
+    ' *   band 2 (0x905A3D00, rows 1824..1855): ESR_EL1.EC, so the exception',
+    ' *           class is readable:',
+    ' *               column = EC & 0xF      (0x21 instruction abort, 0x25 data',
+    ' *                                       abort, 0x26 SP alignment, ...)',
+    ' *               colour = EC >> 4       red 0, green 1, blue 2, black 3',
     ' *',
     ' * The splash is mapped V=P in the bootstrap tables, so the same physical',
-    ' * address is valid in both worlds.',
+    ' * address is valid with the MMU on or off.',
     ' */',
     '\t.align\t2',
     'Llow_vector_paint:',
-    '\tMOV64\tx9, 0x905D7080',
-    '\tmov\t\tw1, #0xFF\t\t\t/* red: R=0xFF in RGB888 */',
-    '\tmov\t\tx2, #32',
-    '1:\tmov\t\tx3, #64',
-    '\tmov\t\tx5, x9',
-    '2:\tstr\t\tw1, [x5], #4',
-    '\tsubs\tx3, x3, #1',
-    '\tb.ne\t2b',
-    '\tadd\t\tx9, x9, #3240',
-    '\tsubs\tx2, x2, #1',
-    '\tb.ne\t1b',
+    '\tmrs\t\tx10, esr_el1',
+    '',
+    '\t/* band 1: which vector slot */',
+    '\tMOV64\tx6, 0x905BD200',
+    '\tmov\t\tx11, #192',
+    '\tmadd\tx6, x9, x11, x6',
+    '\tmov\t\tw1, #0x000000FF\t\t/* red */',
+    '\tbl\t\tLpaint_block',
+    '',
+    '\t/* band 2: ESR_EL1.EC as column (low nibble) and colour (high nibble) */',
+    '\tlsr\t\tx11, x10, #26',
+    '\tand\t\tx12, x11, #0xF',
+    '\tMOV64\tx6, 0x905A3D00',
+    '\tmov\t\tx13, #192',
+    '\tmadd\tx6, x12, x13, x6',
+    '\tlsr\t\tx14, x11, #4',
+    '\tand\t\tx14, x14, #3',
+    '\tlsl\t\tx14, x14, #3\t\t/* 0, 8, 16, 24 */',
+    '\tmov\t\tw1, #0xFF',
+    '\tlsl\t\tw1, w1, w14',
+    '\tbl\t\tLpaint_block',
+    '',
     '\tdsb\t\tsy',
     '3:\twfi',
     '\tb\t\t3b',
+    '',
+    '/* x6 = top-left dword, w1 = colour. 48 dwords by 32 rows, stride 3240. */',
+    'Lpaint_block:',
+    '\tmov\t\tx2, #32',
+    '1:\tmov\t\tx3, #48',
+    '\tmov\t\tx5, x6',
+    '2:\tstr\t\tw1, [x5], #4',
+    '\tsubs\tx3, x3, #1',
+    '\tb.ne\t2b',
+    '\tadd\t\tx6, x6, #3240',
+    '\tsubs\tx2, x2, #1',
+    '\tb.ne\t1b',
+    '\tret',
 ]
 
 
@@ -170,17 +214,34 @@ def patch_start_s():
     )
     print('start.s: magenta breadcrumb after line %d' % (at + 2))
 
-    # --- 3. low vectors jump to the painter ---
+    # --- 3. cyan breadcrumb just before the boot cpu returns into the kernel ---
+    hits = [i for i, l in enumerate(ls) if l == '\tcbnz\tx21, Ltrampoline']
+    assert len(hits) == 1, hits
+    at = None
+    for i in range(hits[0], hits[0] + 16):
+        if ls[i] == '\tsub\t\tx0, x0, x23':
+            at = i
+            break
+    assert at is not None, 'return sequence not found'
+    ls[at + 1:at + 1] = crumb(
+        384,
+        '0x00FFFF00',
+        ('past CPACR/TPIDR/MIDR',
+         'Control reached the return into C, so the MMU write and the three'
+         ' system registers after it all survived.'),
+    )
+    print('start.s: cyan breadcrumb after line %d' % (at + 1))
+
+    # --- 4. low vectors jump to the painter, each carrying its slot number ---
     hits = [i for i, l in enumerate(ls) if l == 'LEXT(LowExceptionVectorBase)']
     assert len(hits) == 1, hits
     base = hits[0]
-    n = 0
-    for i in range(base, base + 80):
-        if ls[i] == '\tb\t\t.':
-            ls[i] = '\tb\t\tLlow_vector_paint'
-            n += 1
-    assert n == 16, 'expected 16 vector slots, rewrote %d' % n
-    print('start.s: rewrote %d low vector slots' % n)
+    slots = [i for i in range(base, base + 80) if ls[i] == '\tb\t\t.']
+    assert len(slots) == 16, 'expected 16 vector slots, found %d' % len(slots)
+    for n, i in reversed(list(enumerate(slots))):
+        ls[i:i + 1] = ['\tmov\t\tx9, #%d' % n,
+                       '\tb\t\tLlow_vector_paint']
+    print('start.s: rewrote %d low vector slots' % len(slots))
 
     # painter goes right after the table, i.e. after its closing .align 12
     end = base
@@ -278,17 +339,23 @@ Give the kernel a way to speak across the boundary:
     isb.  It is still a physical store, so it can only land if the MMU came up
     and the V=P mapping is real;
 
-  * point all sixteen low vector slots at a stack-free painter that fills a
-    red block at a fixed spot and halts.  It uses compile-time mido geometry,
-    so it works with the MMU on and off, and turns "silent freeze" into "an
-    exception was taken".
+  * draw a fifth breadcrumb (cyan) just before the boot CPU returns into C,
+    which also covers CPACR_EL1, TPIDR_EL1 and MIDR_EL1;
 
-Reading the panel from the bottom band, left to right: white, green, yellow,
-magenta, red.
+  * point all sixteen low vector slots at a stack-free painter that fills a red
+    block and halts.  Each slot passes its index in x9, so the position of the
+    block says which vector fired; the painter then decodes ESR_EL1.EC into a
+    second band (column = EC & 0xF, colour = EC >> 4), so one faulting boot
+    reports the exception class as well.
+
+Reading the panel: bottom band is the breadcrumbs, left to right white, green,
+yellow, magenta, cyan.  Above it, a red block at slot*64px names the vector
+that fired, and the band above that carries ESR_EL1.EC.
     white only                   page-table build is at fault
     + green                      the MMU enable or the arm_init jump is
     + yellow + magenta           the MMU is up; whatever broke is past it
-    + red                        the exception painter ran
+    + cyan                       the return into C is reached
+    red block somewhere          an exception was taken; read its position
 """
 
 

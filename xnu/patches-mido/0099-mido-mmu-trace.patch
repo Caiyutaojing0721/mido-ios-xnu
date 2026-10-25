@@ -14,111 +14,170 @@ Give the kernel a way to speak across the boundary:
     isb.  It is still a physical store, so it can only land if the MMU came up
     and the V=P mapping is real;
 
-  * point all sixteen low vector slots at a stack-free painter that fills a
-    red block at a fixed spot and halts.  It uses compile-time mido geometry,
-    so it works with the MMU on and off, and turns "silent freeze" into "an
-    exception was taken".
+  * draw a fifth breadcrumb (cyan) just before the boot CPU returns into C,
+    which also covers CPACR_EL1, TPIDR_EL1 and MIDR_EL1;
 
-Reading the panel from the bottom band, left to right: white, green, yellow,
-magenta, red.
+  * point all sixteen low vector slots at a stack-free painter that fills a red
+    block and halts.  Each slot passes its index in x9, so the position of the
+    block says which vector fired; the painter then decodes ESR_EL1.EC into a
+    second band (column = EC & 0xF, colour = EC >> 4), so one faulting boot
+    reports the exception class as well.
+
+Reading the panel: bottom band is the breadcrumbs, left to right white, green,
+yellow, magenta, cyan.  Above it, a red block at slot*64px names the vector
+that fired, and the band above that carries ESR_EL1.EC.
     white only                   page-table build is at fault
     + green                      the MMU enable or the arm_init jump is
     + yellow + magenta           the MMU is up; whatever broke is past it
-    + red                        the exception painter ran
+    + cyan                       the return into C is reached
+    red block somewhere          an exception was taken; read its position
 
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index c3b0752..623011c 100644
+index c3b0752..4473f58 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -233,42 +233,71 @@ LEXT(_start)
+@@ -233,42 +233,124 @@ LEXT(_start)
  	.global	EXT(LowExceptionVectorBase)
  LEXT(LowExceptionVectorBase)
  	/* EL1 SP 0 */
 -	b		.
++	mov		x9, #0
 +	b		Llow_vector_paint
  	.align	7
 -	b		.
++	mov		x9, #1
 +	b		Llow_vector_paint
  	.align	7
 -	b		.
++	mov		x9, #2
 +	b		Llow_vector_paint
  	.align	7
 -	b		.
++	mov		x9, #3
 +	b		Llow_vector_paint
  	/* EL1 SP1 */
  	.align	7
 -	b		.
++	mov		x9, #4
 +	b		Llow_vector_paint
  	.align	7
 -	b		.
++	mov		x9, #5
 +	b		Llow_vector_paint
  	.align	7
 -	b		.
++	mov		x9, #6
 +	b		Llow_vector_paint
  	.align	7
 -	b		.
++	mov		x9, #7
 +	b		Llow_vector_paint
  	/* EL0 64 */
  	.align	7
 -	b		.
++	mov		x9, #8
 +	b		Llow_vector_paint
  	.align	7
 -	b		.
++	mov		x9, #9
 +	b		Llow_vector_paint
  	.align	7
 -	b		.
++	mov		x9, #10
 +	b		Llow_vector_paint
  	.align	7
 -	b		.
++	mov		x9, #11
 +	b		Llow_vector_paint
  	/* EL0 32 */
  	.align	7
 -	b		.
++	mov		x9, #12
 +	b		Llow_vector_paint
  	.align	7
 -	b		.
++	mov		x9, #13
 +	b		Llow_vector_paint
  	.align	7
 -	b		.
++	mov		x9, #14
 +	b		Llow_vector_paint
  	.align	7
 -	b		.
++	mov		x9, #15
 +	b		Llow_vector_paint
  	.align 12, 0
  
 +/*
-+ * Paint a red block and halt. All sixteen low vector slots land here.
++ * Exception painter. All sixteen low vector slots land here with the slot
++ * number in x9.
 + *
 + * No stack, no boot_args, no C: this may run before or after the MMU is
 + * enabled, so everything is a compile-time constant for the mido panel
-+ * (1080x1920, stride 3240 bytes, 24bpp):
++ * (1080x1920, stride 3240 bytes, 24bpp). It paints two bands:
 + *
-+ *     0x90001000 + (1920 - 32) * 3240 + 512 * 3 = 0x905D7080
++ *   band 1 (0x905BD200, rows 1856..1887): one block at x = slot * 64px,
++ *           always red. Which block lights up says which entry of the
++ *           vector table fired:
++ *               0-3   EL1, SP_EL0   (sync, irq, fiq, serror)
++ *               4-7   EL1, SP_EL1
++ *               8-11  EL0, aarch64
++ *               12-15 EL0, aarch32
++ *
++ *   band 2 (0x905A3D00, rows 1824..1855): ESR_EL1.EC, so the exception
++ *           class is readable:
++ *               column = EC & 0xF      (0x21 instruction abort, 0x25 data
++ *                                       abort, 0x26 SP alignment, ...)
++ *               colour = EC >> 4       red 0, green 1, blue 2, black 3
 + *
 + * The splash is mapped V=P in the bootstrap tables, so the same physical
-+ * address is valid in both worlds.
++ * address is valid with the MMU on or off.
 + */
 +	.align	2
 +Llow_vector_paint:
-+	MOV64	x9, 0x905D7080
-+	mov		w1, #0xFF			/* red: R=0xFF in RGB888 */
-+	mov		x2, #32
-+1:	mov		x3, #64
-+	mov		x5, x9
-+2:	str		w1, [x5], #4
-+	subs	x3, x3, #1
-+	b.ne	2b
-+	add		x9, x9, #3240
-+	subs	x2, x2, #1
-+	b.ne	1b
++	mrs		x10, esr_el1
++
++	/* band 1: which vector slot */
++	MOV64	x6, 0x905BD200
++	mov		x11, #192
++	madd	x6, x9, x11, x6
++	mov		w1, #0x000000FF		/* red */
++	bl		Lpaint_block
++
++	/* band 2: ESR_EL1.EC as column (low nibble) and colour (high nibble) */
++	lsr		x11, x10, #26
++	and		x12, x11, #0xF
++	MOV64	x6, 0x905A3D00
++	mov		x13, #192
++	madd	x6, x12, x13, x6
++	lsr		x14, x11, #4
++	and		x14, x14, #3
++	lsl		x14, x14, #3		/* 0, 8, 16, 24 */
++	mov		w1, #0xFF
++	lsl		w1, w1, w14
++	bl		Lpaint_block
++
 +	dsb		sy
 +3:	wfi
 +	b		3b
 +
++/* x6 = top-left dword, w1 = colour. 48 dwords by 32 rows, stride 3240. */
++Lpaint_block:
++	mov		x2, #32
++1:	mov		x3, #48
++	mov		x5, x6
++2:	str		w1, [x5], #4
++	subs	x3, x3, #1
++	b.ne	2b
++	add		x6, x6, #3240
++	subs	x2, x2, #1
++	b.ne	1b
++	ret
++
  #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
  /*
   * Provide a global symbol so that we can narrow the V=P mapping to cover
-@@ -690,6 +719,21 @@ Lkernelcache_base_found:
+@@ -690,6 +772,21 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
@@ -140,7 +199,7 @@ index c3b0752..623011c 100644
  
  	/*
  	 * Breadcrumb (page tables and mappings built). The MMU is still off, so this writes the
-@@ -887,6 +931,33 @@ common_start:
+@@ -887,6 +984,33 @@ common_start:
  	MSR_SCTLR_EL1_X0
  	isb		sy
  
@@ -174,3 +233,37 @@ index c3b0752..623011c 100644
  #if !VMAPPLE && !defined(SWEET)
  	MOV64   x1, SCTLR_EL1_DEFAULT
  	cmp		x0, x1
+@@ -936,6 +1060,33 @@ common_start:
+ 	add		x0, x20, x22
+ 	sub		x0, x0, x23
+ 
++	/*
++	 * Breadcrumb (past CPACR/TPIDR/MIDR).
++	 * Control reached the return into C, so the MMU write and the three system registers after it all survived.
++	 */
++	ldr		x9, [x20, #40]			/* Video.v_baseAddr */
++	cbz		x9, 1f
++	ldr		x4, [x20, #56]			/* Video.v_rowBytes */
++	cbz		x4, 1f
++	ldr		x2, [x20, #72]			/* Video.v_height */
++	cmp		x2, #32
++	b.lo	1f
++	sub		x2, x2, #32
++	madd	x9, x2, x4, x9
++	mov		x3, #384
++	add		x9, x9, x3, lsl #2
++	mov		w1, #0x00FFFF00
++	mov		x2, #32
++2:	mov		x3, #64
++	mov		x5, x9
++3:	str		w1, [x5], #4
++	subs	x3, x3, #1
++	b.ne	3b
++	add		x9, x9, x4
++	subs	x2, x2, #1
++	b.ne	2b
++1:
++
+ #if KASAN
+ 	mov	x20, x0
+ 	mov	x21, lr
