@@ -139,6 +139,17 @@ jobs:
           # 0110-* sends the self-IPI through GICD_SGIR instead of ICC_SGI1R_EL1
           # on that same controller.
           cp xnu/patches-mido/0110-*.patch dxb/patches/ 2>/dev/null || true
+          # 0111-* shrinks the zone VA window.  The build runs with
+          # XNU_PLATFORM_MacOSX set, which asks for ZONE_MAP_VA_SIZE = 128 GiB,
+          # but a 4 KiB kernel only has VM_MIN..VM_MAX = 112 GiB of kernel VA
+          # with the kernel text in the middle of it, so the "zones" claim can
+          # never be located and kmem_range_init() panics right after mm
+          # bootstrap.  24 GiB is what every non-macOS XNU uses.
+          cp xnu/patches-mido/0111-*.patch dxb/patches/ 2>/dev/null || true
+          # 0112-* makes that panic state its numbers (claim size, hint, map
+          # bounds) instead of only the claim name, and prints the free / claim
+          # totals one line earlier.  Diagnostics only; no behaviour change.
+          cp xnu/patches-mido/0112-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch

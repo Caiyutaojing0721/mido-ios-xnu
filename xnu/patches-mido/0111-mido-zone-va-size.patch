@@ -1,0 +1,30 @@
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 182b44a..15079a7 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -160,7 +160,24 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #define ZONE_GUARD_SPARSE       (64  * 1024)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if XNU_PLATFORM_MacOSX
++/*
++ * A 4 KiB XNU kernel cannot afford the macOS zone window.
++ *
++ * With 4 KiB pages the arm64 kernel VA space is VM_MIN_KERNEL_ADDRESS ..
++ * VM_MAX_KERNEL_ADDRESS = 112 GiB, and the kernel text sits in the middle of
++ * it (LOW_GLOBAL_BASE_ADDRESS + 96 MiB).  The largest single free hole in
++ * kernel_map is therefore only ~64 GiB, so a 128 GiB "zones" claim can never
++ * be located and kmem_range_init() panics with
++ * "vm_map_locate_space failing for claim zones".
++ *
++ * This tree builds with XNU_PLATFORM_MacOSX set, which is where the 128 GiB
++ * comes from.  Use the compact window instead: it is what every non-macOS XNU
++ * has always used, and what the 4 KiB santoni bring-up settled on.  24 GiB of
++ * zone VA is still four orders of magnitude more than this board can fill.
++ */
++#define SWEET_COMPACT_ZONE_VA 1
++
++#if XNU_PLATFORM_MacOSX && !SWEET_COMPACT_ZONE_VA
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+ #else /* XNU_PLATFORM_MacOSX */

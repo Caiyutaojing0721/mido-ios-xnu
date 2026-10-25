@@ -1,0 +1,34 @@
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+index 2927d4b..3b5ca2a 100644
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -3492,6 +3492,13 @@ kmem_add_extra_claims(void)
+ 	for (uint32_t i = 0; i < kmem_claim_count; i++) {
+ 		total_claims += kmem_claims[i].kc_size;
+ 	}
++#if DEBUG || DEVELOPMENT
++	printf("SWEET KMEM: map 0x%lx-0x%lx largest_free 0x%lx claims 0x%lx n %u\n",
++	    (unsigned long)kernel_map->min_offset,
++	    (unsigned long)kernel_map->max_offset,
++	    (unsigned long)largest_free_size, (unsigned long)total_claims,
++	    (unsigned int)kmem_claim_count);
++#endif
+ 	assert((total_claims & PAGE_MASK) == 0);
+ 	largest_free_size -= total_claims;
+ 
+@@ -3592,8 +3599,13 @@ kmem_scramble_ranges(void)
+ 		struct mach_vm_range *sp_range = sp.kc_range;
+ 		if (vm_map_locate_space(kernel_map, sp.kc_size, 0,
+ 		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL) != KERN_SUCCESS) {
+-			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
+-			    sp.kc_name);
++			panic("kmem_range_init: no space for claim %s"
++			    ": size 0x%lx hint 0x%lx map 0x%lx-0x%lx claims %u",
++			    sp.kc_name, (unsigned long)sp.kc_size,
++			    (unsigned long)start,
++			    (unsigned long)kernel_map->min_offset,
++			    (unsigned long)kernel_map->max_offset,
++			    (unsigned int)kmem_claim_count);
+ 		}
+ 
+ 		end = start + sp.kc_size;
