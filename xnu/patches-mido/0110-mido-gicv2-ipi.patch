@@ -1,0 +1,38 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..a40c573 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -19,6 +19,8 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern "C" void sweet_secondary_entry(void);
++extern "C" boolean_t sweet_gicv2;
++extern "C" vm_offset_t sweet_gicd_base;
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ 
+ class SweetCPU;
+@@ -225,7 +227,23 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	    (((mpidr >> 8) & 0xff) << 16) |
+ 	    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
+ 	__builtin_arm_dsb(DSB_ISHST);
+-	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
++	if (sweet_gicv2) {
++		/*
++		 * GIC-400 has no ICC_SGI1R_EL1. The distributor's SGIR takes a target
++		 * list; this driver only ever signals itself (see initCPU), so use the
++		 * "self" filter rather than inventing a CPU numbering.
++		 */
++		uint64_t const self = __builtin_arm_rsr64("MPIDR_EL1") &
++		    (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
++		if ((mpidr & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK)) != self) {
++			panic("SWEET CPU: GIC-400 cross-CPU SGI is not wired up yet (cpu %u)",
++			    logical);
++		}
++		*(volatile uint32_t *)(sweet_gicd_base + 0x0F00) =   /* GICD_SGIR */
++		    (2U << 24) | SWEET_IPI_SGI;
++	} else {
++		__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
++	}
+ 	__builtin_arm_isb(ISB_SY);
+ }
+ 
