@@ -113,13 +113,13 @@ jobs:
           # frames before panicking, and adds marks 10/11 around the two calls
           # that run between stage 4 and stage 5.
           cp xnu/patches-mido/0105-*.patch dxb/patches/ 2>/dev/null || true
-          # 0106-* is the answer 0105's dump produced.  The undefined instruction
-          # was 0xb8280028 == `ldadd w8, w8, [x1]`, an ARMv8.1 LSE atomic, in
-          # lck_grp_reference+8: a Cortex-A53 is ARMv8.0-A and has no LSE.  The
-          # machine config asked for -march=armv8.2-a+crypto (right for SWEET and
-          # polaris, wrong here); narrow it to armv8-a so os_atomic_* lowers to
-          # load-exclusive/store-exclusive pairs.
-          cp xnu/patches-mido/0106-*.patch dxb/patches/ 2>/dev/null || true
+          # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
+          # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
+          # here with a later patch did not work: dxb only warns when a patch
+          # fails to apply, so a skipped 0106 produced a byte-identical kernel
+          # that still trapped on `ldadd`.  Edit the line where it is born, and
+          # let the "Every mido patch must apply" step complain if anything is
+          # ever skipped again.
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
@@ -144,7 +144,23 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee build.log
+
+      # dxb's patch loop only warns when a patch does not apply.  That is how a
+      # -march change could vanish without a trace: the kernel came out
+      # byte-identical and still trapped on `ldadd`.  Fail the job instead, and
+      # keep the reason for the log and for PATCHES.txt on ci-latest.
+      - name: Every mido patch must apply
+        if: always()
+        run: |
+          test -f dxb/build.log || { echo "no build log"; exit 0; }
+          if grep -E "Skipping patch .*/(009[4-9]|01[0-9]{2})-[^ ]*\.patch" dxb/build.log; then
+            echo "::error::dxb skipped a mido patch; the kernel is not what this tree says it is"
+            exit 1
+          fi
+          echo "all mido patches applied"
 
       - name: Package build tree for local compiles
         if: always()
@@ -204,7 +220,14 @@ jobs:
           cp out/kernel.development.sweet kernel.development.sweet
           cp out/SHA256SUMS SHA256SUMS 2>/dev/null || true
           printf '%s\n' "$GITHUB_SHA" > BUILT_FROM
-          git add -f kernel.development.sweet SHA256SUMS BUILT_FROM
+          # Publish what the compiler was actually told, so the packaging side
+          # can verify the target ISA without a GitHub login.
+          grep -o 'march=[^ ]*' dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/.CFLAGS \
+            > FLAGS.txt 2>/dev/null || echo "no .CFLAGS found" > FLAGS.txt
+          grep 'Skipping patch' dxb/build.log > PATCHES.txt 2>/dev/null \
+            || echo "no patch was skipped" > PATCHES.txt
+          cat FLAGS.txt PATCHES.txt
+          git add -f kernel.development.sweet SHA256SUMS BUILT_FROM FLAGS.txt PATCHES.txt
           git commit -qm "ci: kernel from $GITHUB_SHA"
           git push -f origin HEAD:ci-latest
           echo "published $(shasum -a 256 kernel.development.sweet)"
