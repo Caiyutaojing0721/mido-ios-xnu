@@ -86,6 +86,7 @@ jobs:
           cp xnu/patches-mido/0099-*.patch dxb/patches/ 2>/dev/null || true
           cp xnu/patches-mido/0100-*.patch dxb/patches/ 2>/dev/null || true
           cp xnu/patches-mido/0101-*.patch dxb/patches/ 2>/dev/null || true
+          cp xnu/patches-mido/0102-*.patch dxb/patches/ 2>/dev/null || true
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh

@@ -591,9 +591,10 @@ MMU 的另一侧。
 
 顺带排除了两个候选根因：
 
-* **TCR 是对的。** `0x226511a511` 解出来是 `T0SZ=T1SZ=17`、`TG0=0b10`、`TG1=0b01`。
-  注意 ARM 规范里 `TG1` 的编码与 `TG0` **不同**（`TG1=0b01` 才是 16K，见 `proc_reg.h:858`），
-  所以这个值恰好是 16K granule 的正确写法，不要“修”它。
+* **TCR 的编码没错，但 granule 是错的。** `0x226511a511` 解出来是 `T0SZ=T1SZ=17`、
+  `TG0=0b10`、`TG1=0b01`，确实是 16K granule 的正确写法（`TG1` 的编码与 `TG0` 不同，
+  见 `proc_reg.h:858`）。**但 Cortex-A53 根本不实现 16K granule**——见 1.6.12。
+  「编码正确」和「硬件支持」是两件事，这一段当时把两者混为一谈了。
 * **`SCTLR_EL1_DEFAULT` 不含 `WXN`，`ARM_TTE_BOOT_BLOCK` 不含 `PXN`**，所以 MMU 打开后
   继续执行 V=P 映射里的代码不会取指异常。
 
@@ -607,8 +608,8 @@ MMU 的另一侧。
 * 唯一的结构差异是 **granule**：santoni 用 4K（`TTBR1 = x25 + 0x1000`，块 2MB，L2 索引
   右移 21），mido 用 16K（`TTBR1 = x25 + 0x4000`，块 32MB，索引右移 25）。
 
-因此 SCTLR 的 RES0 位、16K granule 支持、MAIR 属性这些“可疑点”都不是差异来源——两个
-内核写的是同一个常量，跑在同一种核（Cortex-A53）上。
+因此 SCTLR 的 RES0 位、MAIR 属性这些“可疑点”都不是差异来源——两个内核写的是同一个
+常量，跑在同一种核（Cortex-A53）上。**剩下的那个结构差异（granule）就是根因，见 1.6.12。**
 
 `0099-mido-mmu-trace.patch` 因此改四处：
 
@@ -715,6 +716,46 @@ sha256 `c76e691f…2848d9cf`），自检九项全过，唯独第五块的颜色�
 **这一轮不必为它再跑一次 CI**：第五块是黄也不影响判读，按「数几块」读即可——
 底部一行 `白 绿 黄 洋红 黄` 就是五块全到，说明 `ret` 之前无事。
 
+#### 1.6.12 根因：Cortex-A53 没有 16KB 页粒度（`0102`）
+
+第六次上机（`0100` 内核，常量进度块）：底部**白 + 绿 + 黄**，洋红缺席。这次探针里
+一条 `ldr` 都没有，所以只剩下一个解释：`MSR SCTLR_EL1` / `isb` 本身就过不去。
+
+**硬件事实**：Cortex-A53（SDM8953 的八个核）**不实现 16KB translation granule**。
+`ID_AA64MMFR0_EL1.TGran16` 在这一核上恒为 0，是设计如此（ARM DDI 0500 §4.2.1），
+SoC 集成商也改不了。把 `TCR_EL1.TG0/TG1` 写成 `0b10` 之后所有翻译都会失败，于是
+开 MMU 之后的第一条 `str` 立刻 data abort；而此时 `VBAR_EL1` 指向的内核 VA 同样翻译
+失败，取指再 abort 一次，屏幕上一个字节都留不下。这与实测现象完全吻合。
+
+旁证：Aleph Security 的 iOS-on-QEMU/KVM 工作在同一块 Rock64（A53）上撞过同一堵墙，
+最后只能换支持 16K 的核（Cavium/Ampere 服务器）继续。而 santoni 那个**能**跑起 XNU
+的 payload 是 **4KB** 构建（`TTBR1 = x25 + 0x1000`、2MB 块、L2 索引右移 21）。
+我们自己的内核来自 sweet（Kryo 470 = A76/A55，两者都支持 16K），机器配置里写着
+`#define __ARM_16K_PG__ 1`。
+
+**三处必须一起改**（`0102-mido-4k-pages.patch`）：
+
+| 文件 | 改动 | 原因 |
+| --- | --- | --- |
+| `pexpert/pexpert/arm64/SWEET.h` | 删掉 `__ARM_16K_PG__` | `PGBYTES` 变 4096，`TCR` 的 `TG0/TG1` 都变 4KB、`T0SZ/T1SZ=25` |
+| `makedefs/MakeInc.def` | 删掉 MacOSX 的 `-DARM_LARGE_MEMORY=1` 覆盖 | `ARM_LARGE_MEMORY` 把内核链到 `0xfffffe0007004000`（-2TB），需要 41 位内核 VA；4KB 配置只描述 39 位（`proc_reg.h` 的表写得很清楚），TTBR1 够不到 |
+| `osfmk/arm64/start.s` | splash 的 V=P 映射从 1 个块改成 4 个连续块 | 块大小随 granule 变（`ARM_TT_L2_SIZE`：16K→32MB，4K→2MB）。面板缓冲是 `0x90001000 + 0x5EEC00` = 5.9MB，一个 2MB 块盖不住；四块覆盖 `0x90000000..0x907FFFFF`，顺带盖住 `0x905D6700` 的进度块色带 |
+
+链基址随之变成 `0xfffffff007004000`（-64GB），**正是 santoni 的布局**；payload 的
+`virt_base` 由 `mkpayload` 从 Mach-O `__TEXT` 算出来，变成 `0xfffffff006000000`，
+与 santoni 的 payload 头逐字段同型。shim 和工具里没有任何内核 VA 硬编码，全部自适应。
+
+验证：
+
+```sh
+tools/mkpatch_mido_4k.py     # 从 out/mido4k-src（CI 树）+ out/p101 导出 diff，改完逐字节回放
+tools/check_mido_4k_asm.py   # 抽出四块映射单独汇编，核 4 条 str 偏移 0/8/16/24 + 2MB 步进
+```
+
+这一步之后预期：底部 `白 绿 黄 洋红`（常量 V=P 生效 = MMU 真的开了），随后 0098 的
+早期控制台开始出字（因为 MMU 通了，内核终于能走到 `arm_vm_init`）。
+
+
 ## 2. 交付物一览
 
 ```
@@ -733,6 +774,8 @@ tools/check_mmu_trace_asm.py            # 单独汇编向量表/painter，校验
 tools/mkpatch_mido_mmu_const.py         # 生成 0100：两个后置进度块改常量几何 + dsb
 tools/check_const_crumbs.py             # 抽出 0100 的两块单独汇编（自带 MOV64 宏）
 tools/mkpatch_mido_crumb_color.py       # 生成 0101：第五块颜色改回青（字节序修正）
+tools/mkpatch_mido_4k.py                # 生成 0102：4KB 页 + 经典 iOS 链基址 + splash 四块映射
+tools/check_mido_4k_asm.py              # 单独汇编 0102 的四块映射，核偏移/步进编码
 xnu/patches-mido/0094-mido-display-scaling.patch   # iPhone X 画布按高度缩放进 1080×1920
 xnu/patches-mido/0095-mido_board.patch             # bsd/dev/mido_board.c（板型判定）
 xnu/patches-mido/0095-mido_emmc.patch              # bsd/dev/mido_emmc.c（eMMC 门禁 stub）
@@ -743,6 +786,7 @@ xnu/patches-mido/0098-mido-early-console.patch     # 控制台延后到最终映
 xnu/patches-mido/0099-mido-mmu-trace.patch         # splash 的 V=P 映射 + MMU 后洋红块 + 异常红块 painter
 xnu/patches-mido/0100-mido-mmu-const-crumbs.patch  # 后置进度块改常量几何（不读 boot_args）+ dsb
 xnu/patches-mido/0101-mido-crumb-color.patch       # 第五块颜色 0x0000FFFF→0x00FFFF00（整字写是小端）
+xnu/patches-mido/0102-mido-4k-pages.patch          # A53 无 16K granule：改 4KB 页 + 非 large-memory 链基址
 xnu/patches-mido/src/                  # 上述 .c 的参考源（patch 由它生成）
 xnu/patches-mido/mido-hook.sh          # 把 mido 驱动接入 conf/files 与初始化的本地脚本
 shim/emmc.c shim/emmc.h                # 只读 eMMC/SDHCI 探针

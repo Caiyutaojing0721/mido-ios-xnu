@@ -1,0 +1,112 @@
+mido: 4KB pages and the classic iOS kernel base (Cortex-A53 has no 16K granule)
+
+The panel stopped right after the yellow breadcrumb, i.e. at `MSR SCTLR_EL1`,
+because the Cortex-A53 implements no 16KB translation granule: its
+ID_AA64MMFR0_EL1.TGran16 field is 0 by design (ARM DDI 0500 4.2.1).  With
+TCR_EL1.TG0/TG1 = 0b10 every translation faults, the first store after the MMU
+enable aborts, and the vector fetch aborts as well, so nothing is ever printed.
+The santoni payload that does boot XNU on the same core class is a 4KB build.
+
+Three changes, which only make sense together:
+
+  * pexpert/pexpert/arm64/SWEET.h: drop `__ARM_16K_PG__`.  PGBYTES becomes 4096
+    and TCR_EL1 gets TG0/TG1 = 4KB with T0SZ/T1SZ = 25.
+
+  * makedefs/MakeInc.def: drop the MacOSX `-DARM_LARGE_MEMORY=1` override.
+    ARM_LARGE_MEMORY links at 0xfffffe0007004000 (-2TB), which needs 41 bits of
+    kernel VA; the 4KB configuration only describes 39 bits.  The kernel goes
+    back to 0xfffffff007004000 (-64GB), the layout the working santoni payload
+    uses (virt_base 0xfffffff006000000).
+
+  * osfmk/arm64/start.s: the splash V=P mapping inserted a single block, which
+    covered 32MB with 16KB pages but only 2MB with 4KB pages.  The panel buffer
+    is 0x90001000 + 0x5EEC00, so map four consecutive blocks (8MB), which also
+    covers the breadcrumb band at 0x905D6700.
+
+Everything else follows: mkpayload derives virt_base from the Mach-O __TEXT
+vmaddr, the shim computes PA from the payload header, and neither has a kernel
+VA hardcoded.
+
+Expected panel after this: white + green + yellow + magenta (constant V=P
+crumbs) and then the 0098 early console text, because with a working MMU the
+kernel finally reaches arm_vm_init.
+
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 69b13f9..9a31a7b 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -330,12 +330,17 @@ LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY
+ ARM64_PLKSEG_ADDR  =0xfffffff004004000
+ ARM64_LINK_ADDR    =0xfffffff007004000
+ 
+-# Use ARM_LARGE_MEMORY config for all MacOSX targets.
+-ifneq ($(filter $(PLATFORM),MacOSX),)
+-LARGE_MEMORY_DEFINE=-DARM_LARGE_MEMORY=1
+-ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+-ARM64_LINK_ADDR    =0xfffffe0007004000
+-endif
++# mido: do NOT use the macOS ARM_LARGE_MEMORY layout here.
++#
++# ARM_LARGE_MEMORY links the kernel at 0xfffffe0007004000 (-2TB), which needs a
++# 41-bit kernel VA.  XNU's 4KB-page configuration only describes a 39-bit range
++# (T0SZ/T1SZ = 25), so TTBR1 could never reach it.  mido has to run 4KB pages
++# because the Cortex-A53 implements no 16KB translation granule, so the kernel
++# goes back to the classic iOS base at -64GB, which is where the working
++# santoni payload (virt_base 0xfffffff006000000) lives too.
++#
++# The MacOSX override below is deliberately gone; this patch is only ever
++# applied by the mido workflow.
+ 
+ 
+ CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index a85bfe6..2ae6102 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -785,7 +785,21 @@ Lkernelcache_base_found:
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+-	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	add		x13, x13, x12, lsl #TTE_SHIFT
++	/*
++	 * A block is ARM_TT_L2_SIZE (32MB with 16KB pages, 2MB with 4KB pages).
++	 * mido runs 4KB pages and its panel buffer is 0x90001000 + 0x5EEC00, so
++	 * one block is not enough: map four consecutive blocks, 0x90000000 to
++	 * 0x907FFFFF.  That also covers the breadcrumb band at 0x905D6700.
++	 */
++	mov		x16, #(ARM_TT_L2_SIZE)
++	str		x11, [x13]
++	add		x11, x11, x16
++	str		x11, [x13, #(1 << TTE_SHIFT)]
++	add		x11, x11, x16
++	str		x11, [x13, #(2 << TTE_SHIFT)]
++	add		x11, x11, x16
++	str		x11, [x13, #(3 << TTE_SHIFT)]
+ 
+ 
+ 	/*
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..a43eac7 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -34,7 +34,18 @@
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+ #define __ARM_PAN_AVAILABLE__     1
+-#define __ARM_16K_PG__            1
++/*
++ * No __ARM_16K_PG__ here.
++ *
++ * The Cortex-A53 (SDM8953) does not implement the 16KB translation granule:
++ * ID_AA64MMFR0_EL1.TGran16 reads 0 by design (ARM DDI 0500, 4.2.1), SoC
++ * designers cannot enable it.  Programming TCR_EL1.TG0/TG1 = 0b10 therefore
++ * leaves every translation faulting, and the first store after
++ * `MSR SCTLR_EL1` takes a data abort whose vector fetch also faults -- the
++ * kernel dies silently right after the last pre-MMU breadcrumb.
++ *
++ * Defining this back for mido reproduces exactly that hang.
++ */
+ 
+ #define HAS_GIC_V3                1
+ 
