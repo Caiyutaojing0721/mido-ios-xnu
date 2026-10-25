@@ -1,0 +1,28 @@
+mido: paint the fifth breadcrumb cyan (0100 wrote yellow)
+
+shim/console.c stores 24bpp pixels as p[0]=R p[1]=G p[2]=B, but the breadcrumbs
+store a whole word with `str w1, [x5], #4`, which is little-endian, so the byte
+order is inverted.  0x0000FFFF therefore renders yellow (bytes FF FF 00), and
+0100's "cyan fix" turned the fifth crumb into a second yellow block.
+
+The panel already proved this: 0098's third crumb was 0x0000FFFF and it came out
+yellow.  The correct cyan word is 0x00FFFF00 (bytes 00 FF FF).
+
+Green and magenta are symmetric, so only this one block changes.
+
+    white green yellow magenta yellow   (0100 build, count blocks: 5 = reached ret)
+    white green yellow magenta cyan     (after this patch)
+
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 6a97e7c..a85bfe6 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -1062,7 +1062,7 @@ common_start:
+ 	 * MMU write itself failing.
+ 	 */
+ 	MOV64	x9, 0x905D6D00
+-	mov		w1, #0x0000FFFF
++	mov		w1, #0x00FFFF00
+ 	mov		x2, #32
+ 2:	mov		x3, #64
+ 	mov		x5, x9

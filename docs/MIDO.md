@@ -670,8 +670,8 @@ ldr     x9, [x20, #40]          /* Video.v_baseAddr */
    `+ 288*4`（洋红，x=384px）/ `+ 384*4`（青，x=512px），**在第一条 `str` 之前一条 `ldr`
    都没有**，不碰 `x20`、不读 `Video`。
 2. **每块末尾加 `dsb sy`**，把 Normal-NC 的写缓冲排空。
-3. **修掉青色写错**：`0x00FFFF00` 在这个小端 BGR 排列的 24bpp 屏上是**黄**（字节 `00 FF FF`），
-   真正的青是 `0x0000FFFF`（字节 `FF FF 00`）。
+3. ~~修掉青色写错~~ —— **这一步改错了方向，见 1.6.11**。`0100` 把第五块从 `0x00FFFF00`
+   改成了 `0x0000FFFF`，而后者在这块屏上就是**黄**，等于又画了一遍第三块。
 
 现在的判读是干净的：
 
@@ -679,7 +679,7 @@ ldr     x9, [x20, #40]          /* Video.v_baseAddr */
 | --- | --- |
 | 白 + 绿 + 黄 | `MSR SCTLR_EL1` 或 `isb` 本身出错（唯一可能） |
 | … + 洋红 | MMU 已开，V=P 映射真实有效 |
-| … + 青 | `CPACR_EL1` / `TPIDR_EL1` / `MIDR_EL1` 都过了，`ret` 进 C 之前 |
+| … + 第 5 块 | `CPACR_EL1` / `TPIDR_EL1` / `MIDR_EL1` 都过了，`ret` 进 C 之前 |
 | 上方出现红块 | 取了异常；块位置 = 向量号，再上一带 = `ESR_EL1.EC` |
 
 验证：
@@ -688,6 +688,32 @@ ldr     x9, [x20, #40]          /* Video.v_baseAddr */
 tools/mkpatch_mido_mmu_const.py   # 生成 0100：从 out/p99 树导出 diff + 逐字节回放
 tools/check_const_crumbs.py       # 抽出两个块单独汇编（含 MOV64 宏），防止手写错
 ```
+
+#### 1.6.11 颜色字节序搞反了，第五块实际是黄（`0101`）
+
+`0100` 编出的内核已经打过一次镜像（`out/shim-mido-xnu-gz.img`，16,910,336 字节，
+sha256 `c76e691f…2848d9cf`），自检九项全过，唯独第五块的颜色仍不对。
+
+原因在**两种写屏方式的字节序相反**：
+
+- shim 控制台（`shim/console.c` 的 `put_px`）按 `p[0]=c>>16, p[1]=c>>8, p[2]=c` 逐字节写，
+  内存顺序是 **R,G,B**，所以 `RED=0x00ff0000` 出来是红。
+- 进度块用 `str w1, [x5], #4` 整字写，小端序把**低字节**先落地，字节序正好倒过来。
+
+于是同一个字在两套代码里含义相反：
+
+| 字 | `str` 落地的字节 | 屏幕颜色 |
+| --- | --- | --- |
+| `0x0000FF00` | `00 FF 00` | 绿 |
+| `0x0000FFFF` | `FF FF 00` | **黄** |
+| `0x00FF00FF` | `FF 00 FF` | 洋红 |
+| `0x00FFFF00` | `00 FF FF` | **青** |
+
+真机早就给过答案：0098 的第三块是 `0x0000FFFF`，用户看到的就是黄。绿和洋红在字节交换下
+是对称的，所以只有第五块受影响。`0101-mido-crumb-color.patch` 把第五块改回 `0x00FFFF00`。
+
+**这一轮不必为它再跑一次 CI**：第五块是黄也不影响判读，按「数几块」读即可——
+底部一行 `白 绿 黄 洋红 黄` 就是五块全到，说明 `ret` 之前无事。
 
 ## 2. 交付物一览
 
@@ -704,8 +730,9 @@ tools/mkpatch_mido_early.py             # 生成 0098：合成树导出 diff + �
 tools/check_early_asm.py                # 把 start.s 里两段进度块单独汇编
 tools/mkpatch_mido_mmu_trace.py         # 生成 0099：splash V=P 映射 + 洋红/青块 + 带编号的异常 painter
 tools/check_mmu_trace_asm.py            # 单独汇编向量表/painter，校验 16 个槽位可跳
-tools/mkpatch_mido_mmu_const.py         # 生成 0100：两个后置进度块改常量几何 + dsb + 修青色
+tools/mkpatch_mido_mmu_const.py         # 生成 0100：两个后置进度块改常量几何 + dsb
 tools/check_const_crumbs.py             # 抽出 0100 的两块单独汇编（自带 MOV64 宏）
+tools/mkpatch_mido_crumb_color.py       # 生成 0101：第五块颜色改回青（字节序修正）
 xnu/patches-mido/0094-mido-display-scaling.patch   # iPhone X 画布按高度缩放进 1080×1920
 xnu/patches-mido/0095-mido_board.patch             # bsd/dev/mido_board.c（板型判定）
 xnu/patches-mido/0095-mido_emmc.patch              # bsd/dev/mido_emmc.c（eMMC 门禁 stub）
@@ -714,7 +741,8 @@ xnu/patches-mido/0096-mido-fbcon-24bpp.patch       # fbcon 读 ADT depth、支�
 xnu/patches-mido/0097-mido-early-console.patch     # 引导期控制台：映射 mido 开屏、按 24bpp 画
 xnu/patches-mido/0098-mido-early-console.patch     # 控制台延后到最终映射；start.s 加两段 MMU 前进度块
 xnu/patches-mido/0099-mido-mmu-trace.patch         # splash 的 V=P 映射 + MMU 后洋红块 + 异常红块 painter
-xnu/patches-mido/0100-mido-mmu-const-crumbs.patch  # 后置进度块改常量几何（不读 boot_args）+ dsb + 修青色
+xnu/patches-mido/0100-mido-mmu-const-crumbs.patch  # 后置进度块改常量几何（不读 boot_args）+ dsb
+xnu/patches-mido/0101-mido-crumb-color.patch       # 第五块颜色 0x0000FFFF→0x00FFFF00（整字写是小端）
 xnu/patches-mido/src/                  # 上述 .c 的参考源（patch 由它生成）
 xnu/patches-mido/mido-hook.sh          # 把 mido 驱动接入 conf/files 与初始化的本地脚本
 shim/emmc.c shim/emmc.h                # 只读 eMMC/SDHCI 探针

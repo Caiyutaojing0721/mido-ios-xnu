@@ -12,7 +12,7 @@ On the panel that looks identical to SCTLR_EL1 itself faulting, which is exactly
 the ambiguity the probe was supposed to remove.
 
 Rewrite both breadcrumbs to use compile-time mido geometry only (1080x1920,
-stride 3240, 24bpp, bottom band is row 1920-32 = 1888 -> 0x905D6E00), with no
+stride 3240, 24bpp, bottom band is row 1920-32 = 1888 -> 0x905D6700), with no
 loads at all before the first store, and a dsb sy so the Normal-NC writes reach
 the bus before the kernel moves on.
 
@@ -38,7 +38,7 @@ PATCH = os.path.join(ROOT, 'xnu/patches-mido/0100-mido-mmu-const-crumbs.patch')
 T_START = 'osfmk/arm64/start.s'
 
 # row 1920-32, stride 3240, base 0x90001000
-BAND = 0x90001000 + (1920 - 32) * 3240          # 0x905D6E00
+BAND = 0x90001000 + (1920 - 32) * 3240          # 0x905D6700
 
 
 def const_block(addr, color, what):
@@ -177,7 +177,7 @@ could fault on its own first instruction -- indistinguishable on the panel from
 SCTLR_EL1 faulting, which is the ambiguity the probe exists to remove.
 
 Rewrite both breadcrumbs with compile-time mido geometry (1080x1920, stride
-3240, 24bpp, band at row 1920-32 -> 0x905D6E00), no loads before the first
+3240, 24bpp, band at row 1920-32 -> 0x905D6700), no loads before the first
 store, and a trailing dsb sy so the Normal-NC writes reach the bus.
 
 Fix the second colour too: 0x00FFFF00 is yellow in this BGR-ordered 24bpp
