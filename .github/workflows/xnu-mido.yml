@@ -157,9 +157,31 @@ jobs:
           # that still trapped on `ldadd`.  Edit the line where it is born, and
           # let the "Every mido patch must apply" step complain if anything is
           # ever skipped again.
-          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
-          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # libfirehose_kernel is the one blob the XNU makefiles never see:
+          # dxb builds it with `xcodebuild -target libfirehose_kernel` and the
+          # libdispatch xcconfig, so MACHINE_FLAGS_ARM64_SWEET (0004) cannot
+          # reach it.  dxb asks for ARCHS="x86_64 arm64e", and arm64e means
+          # ARMv8.3, so its os_atomic_* lower to LSE -- six `ldadd`/`ldset`/
+          # `ldclr` words that a Cortex-A53 traps on.  Those six are the panic
+          # that repeated at __firehose_buffer_tracepoint_flush+0x18:
+          #
+          #   panic: Undefined kernel instruction
+          #   pc=0xfffffff007260a0c instr=0xf8280128   ->  ldadd x8, x8, [x0]
+          #
+          # Adding "arm64" next to arm64e was not enough: the archive then has
+          # both slices and the link still resolved the arm64e one.  Build it
+          # for plain arm64 only, and pin the ISA with -mcpu as well (the
+          # xcconfig's OTHER_CFLAGS is a plain assignment, so the exact value
+          # has to be repeated here or -mkernel would be lost).
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64" VALID_ARCHS="x86_64 arm64"/' dxb/build.sh
+          sed -i '' 's|xcodebuild install -target libfirehose_kernel |xcodebuild install -target libfirehose_kernel OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53+crypto" |' dxb/build.sh
+          # A sed that silently does not match would otherwise ship the same
+          # broken archive again, and only the finished kernel would show it.
+          grep -q 'ARCHS="x86_64 arm64" VALID_ARCHS="x86_64 arm64"' dxb/build.sh \
+            || { echo "::error::could not narrow libfirehose_kernel to arm64"; exit 1; }
+          grep -q 'OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53+crypto"' dxb/build.sh \
+            || { echo "::error::could not pin libfirehose_kernel to cortex-a53"; exit 1; }
+          grep -n 'target libfirehose_kernel' dxb/build.sh
           ls dxb/patches
 
       - name: Deps
@@ -198,6 +220,24 @@ jobs:
             exit 1
           fi
           echo "all mido patches applied"
+
+      # The kernel is arm64, so the arm64e slice of libfirehose_kernel is what
+      # got pulled in -- and arm64e means ARMv8.3, i.e. LSE.  Assert the slice
+      # is simply not there any more instead of guessing from the flags.
+      - name: libfirehose_kernel must be plain arm64
+        if: always()
+        run: |
+          ARCH=$(find dxb -name 'libfirehose_kernel.a' 2>/dev/null | head -1)
+          test -n "$ARCH" || { echo "no libfirehose_kernel.a (build stopped earlier)"; exit 0; }
+          echo "archive: $ARCH"
+          lipo -info "$ARCH"
+          if lipo -archs "$ARCH" | tr ' ' '\n' | grep -qx arm64e; then
+            echo "::error::libfirehose_kernel still ships an arm64e slice; its LSE atomics trap on a Cortex-A53"
+            exit 1
+          fi
+          lipo -archs "$ARCH" | tr ' ' '\n' | grep -qx arm64 \
+            || { echo "::error::libfirehose_kernel has no arm64 slice"; exit 1; }
+          echo "OK: arm64 only"
 
       # Downloading run logs of a private repo needs a token we do not have, so
       # when a build breaks, keep the tail of the log on its own orphan branch.
@@ -246,19 +286,21 @@ jobs:
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
       # A Cortex-A53 traps on every ARMv8.1 atomic, so a single stray `ldadd`
-      # means a kernel that boots to an undefined-instruction panic.  The
-      # target flag is -mcpu=cortex-a53+crypto (0004); this checks the bytes
-      # instead of trusting the flag.
+      # means a kernel that boots straight into an undefined-instruction panic.
+      # The target flag is -mcpu=cortex-a53+crypto (0004); this checks the
+      # bytes instead of trusting the flag -- and it scans EVERY instruction
+      # section of the whole linked kernel, not just __TEXT_EXEC.
       #
-      # One known exception: libfirehose_kernel is not built by the XNU
-      # makefiles (dxb runs `xcodebuild -target libfirehose_kernel` with its
-      # own xcconfig), so MACHINE_FLAGS_ARM64_SWEET never reaches it and its
-      # five atomics keep the arm64e baseline.  check_lse.py names them and
-      # lets them through; anything else still fails the job.
+      # The old check_lse.py allowed the six atomics inside libfirehose_kernel
+      # as "only reached after something drains a firehose buffer".  That was
+      # wrong: they run on the boot path, which is how
+      # __firehose_buffer_tracepoint_flush+0x18 trapped.  There is no allowlist
+      # any more; the archive itself is now built for ARMv8.0.
       - name: Verify the kernel has no ARMv8.1 atomics
         run: |
           test -f out/kernel.development.sweet || { echo "no kernel built"; exit 0; }
-          python3 tools/check_lse.py out/kernel.development.sweet
+          python3 tools/lse_scan.py out/kernel.development.sweet
+          python3 tools/check_zone_va.py out/kernel.development.sweet
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -291,10 +333,19 @@ jobs:
             echo
             grep -n 'MACHINE_FLAGS_ARM64_SWEET' dxb/xnu/makedefs/MakeInc.def
           } > FLAGS.txt 2>/dev/null || echo "no .CFLAGS found" > FLAGS.txt
+          # libfirehose_kernel never sees .CFLAGS, so publish its slice list
+          # and clang invocation separately; without this the only offline
+          # evidence about it is "the kernel still has ldadd".
+          {
+            ARCH=$(find dxb -name 'libfirehose_kernel.a' | head -1)
+            echo "archive: $ARCH"
+            lipo -detailed_info "$ARCH" 2>&1 | grep -E 'architecture|align|cputype'
+            find dxb/build -maxdepth 6 -name 'libfirehose_kernel.build' 2>/dev/null | head -3
+          } > FIREHOSE.txt 2>&1 || echo "no libfirehose_kernel.a" > FIREHOSE.txt
           grep 'Skipping patch' dxb/build.log > PATCHES.txt 2>/dev/null \
             || echo "no patch was skipped" > PATCHES.txt
-          cat FLAGS.txt PATCHES.txt
-          git add -f kernel.development.sweet SHA256SUMS BUILT_FROM FLAGS.txt PATCHES.txt
+          cat FLAGS.txt FIREHOSE.txt PATCHES.txt
+          git add -f kernel.development.sweet SHA256SUMS BUILT_FROM FLAGS.txt FIREHOSE.txt PATCHES.txt
           git commit -qm "ci: kernel from $GITHUB_SHA"
           git push -f origin HEAD:ci-latest
           echo "published $(shasum -a 256 kernel.development.sweet)"

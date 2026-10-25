@@ -1293,6 +1293,78 @@ SWEET KMEM: map 0xffffffe000000000-0xfffffffbffffffff largest_free 0x... claims 
 
 所以在看到屏幕之前，不提前动 eMMC——但这就是 1.9 之后的第一顺位。
 
+### 1.10 第二次 UNDEF：被"放行"的六个 firehose 原子（0113）
+
+越过 1.9 之后屏幕上是：
+
+```
+panic(cpu 0 caller 0xfffffff007ac1248): Undefined kernel instruction
+pc=0xfffffff007260a0c instr=0xf8280128 @//sleh.c/:1004
+```
+
+`0xf8280128` 解码是 `ldadd x8, x8, [x0]`（size=11b → 64 位，opc=000 → LDADD，
+`A=R=0`），又一条 ARMv8.1 LSE。pc 落在：
+
+```
+0xfffffff007260a0c -> __TEXT_EXEC, __firehose_buffer_tracepoint_flush+0x18
+```
+
+#### 1.10.1 这是我自己放过的
+
+1.4 里写的 `tools/check_lse.py` 只扫 `__TEXT_EXEC`，并且**白名单**了 5 个
+libfirehose_kernel 里的原子，理由是"只在有人排空 firehose 缓冲时才走到，早期启动不会碰"。
+这个理由有一半是错的：
+
+- 扫段没错到"只有一处"——用全 section 扫描（`tools/lse_scan.py`）重扫，是 **6 处**，
+  全在 firehose 里：`_firehose_buffer_tracepoint_reserve_slow+0x114`(ldclr)、
+  `_firehose_buffer_stream_chunk_install+0x70`(ldset)、
+  `__firehose_buffer_tracepoint_flush+0x18`(ldadd)、
+  `__firehose_merge_updates+0xb8`(ldaddl)、`+0xcc`/`+0xe0`(ldadd)；
+- "早期不会碰"是错的。`libkern/os/log.c:_firehose_trace()` 先调
+  `__firehose_buffer_tracepoint_reserve()`，**只要它返回非 NULL 就直接
+  `__firehose_buffer_tracepoint_flush(ft, ftid)`**。也就是说这条路径就在 `kprintf`
+  之后的正常日志流程上，不是冷门角落。
+
+#### 1.10.2 根因：libfirehose_kernel 被编成 arm64e
+
+这个 blob 是**唯一**绕开 XNU makefile 的东西：dxb 用
+`xcodebuild -target libfirehose_kernel` + libdispatch 的 `xcodeconfig/libfirehose_kernel.xcconfig`
+单独编，所以 0004 里的 `MACHINE_FLAGS_ARM64_SWEET`（`-mcpu=cortex-a53+crypto`）永远到不了它。
+dxb 原始请求的是：
+
+```
+ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"
+```
+
+**arm64e 意味着 ARMv8.3，包含 LSE**，于是它的 `os_atomic_*` 全部落成 `ldadd/ldset/ldclr`。
+我们的内核本身是纯 arm64（`cputype 0x0100000c / cpusubtype 0x0`），链接时就从 fat 归档里
+取了那一片 arm64e。
+
+上次的修法（在 ARCHS 里**追加** `arm64`，变成 `"x86_64 arm64e arm64"`）不够：
+归档同时有两片，链接仍然解析到 arm64e 那片。所以这次改成**只留 arm64**，并用
+`OTHER_CFLAGS` 把 ISA 也钉死：
+
+```
+sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64" VALID_ARCHS="x86_64 arm64"/' dxb/build.sh
+sed -i '' 's|xcodebuild install -target libfirehose_kernel |xcodebuild install -target libfirehose_kernel OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53+crypto" |' dxb/build.sh
+```
+
+`OTHER_CFLAGS` 必须把 xcconfig 里那三个原本的值一字不差地重写一遍——xcconfig 是
+`OTHER_CFLAGS = -mkernel -nostdinc -Wno-packed` 这种**普通赋值**，命令行会整体覆盖，
+漏掉 `-mkernel` 就等于编出个用户态目标文件。
+
+#### 1.10.3 三道新守门
+
+1. **sed 必须命中**：两条 `grep -q` 不命中就 `exit 1`（否则又是一次"绿但没改"）。
+2. **归档必须没有 arm64e**：build 之后直接
+   `lipo -archs libfirehose_kernel.a`，出现 `arm64e` 或缺少 `arm64` 就 fail。
+   同时把 `lipo -detailed_info` 写进 ci-latest 的 `FIREHOSE.txt`，离线也能查。
+3. **内核里零容忍**：`tools/lse_scan.py` 扫**所有**带 `S_ATTR_*_INSTRUCTIONS`
+   的 section（不再只看 `__TEXT_EXEC`），**一个白名单都没有**。
+   `tools/check_lse.py` 退化成它的 shim，老引用不会得到"放行"的答案。
+
+旧的 `check_lse.py` 结论（"5 处 firehose 是已知例外"）**作废**。
+
 ## 2. 交付物一览
 
 ```
