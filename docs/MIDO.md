@@ -1047,6 +1047,137 @@ payload 段与内核段一一对应、0099 向量表在 `__TEXT_EXEC+0x1c9000`�
 说明 `arm_vm_init.c` 的代码长度真的变了——这正是 0108 应有的表现。对照
 0.4 节那两次"绿但字节不变"的假成功，这一次是有位移的。
 
+### 1.8 GIC-400：1850 之后的第二关（0109/0110）
+
+#### 1.8.1 屏幕给了什么
+
+0108 的内核越过了 `arm_vm_init.c:1850`，而且**控制台换到了真正的 fb console**
+——`kprintf` 打出了一整屏，字体清晰：
+
+```
+kprintf initialized
+Serial mode specified: 00000003
+initialize_screen: b=90001000, w=00000438, h=00000780, r=00000CA8, d=00000000
+pe_arm_init_interrupts: args: 0xfffffff007b7a730
+pe_arm_map_interrupt_controller: soc_phys: 0x1000000
+pe_arm_map_interrupt_controller: failed to find the interrupt-controller.
+pe_arm_init_debug: failed to find cpu-debug-interface
+SWEET GIC: virtual timer INTID 28
+panic(cpu 0 caller 0xfffffff007b22ad8): find_gicr_pe_base: cannot find GICR base
+  for core 0 @//pe_fiq.c/:73
+```
+
+`w=0x438`（1080）、`h=0x780`（1920）、`r=0xCA8`（3240 = 1080×3）说明 24bpp
+面板参数已经对了；能连续打出这么多行，说明早期 fb 别名、行距、滚动都是通的。
+
+`initialize_screen` 之前那三行来自 `PE_init`，它在 `arm_vm_init` **之后**才跑，
+所以 `pe_init_fiq()` 是 1850 之后的第一个关口，不是之前的。§1.7.5 我把
+`SWEET EARLY 6: cpu_init done` 当成"`pe_init_fiq` 已经跑过"是**错的**：
+`PE_init_cpu` 由 `PE_init` 调用，而 `PE_init` 在 VM 初始化之后。
+
+#### 1.8.2 为什么必然 panic
+
+MSM8953 是 **GIC-400（GICv2）**：GICD `0x0b000000`、CPU 接口 GICC
+`0x0b002000`，**没有 redistributor**。而 `pe_fiq.c` 的整段代码都在
+`#if HAS_GIC_V3` 里，它把 DT `reg` 的第 3/4 格当成 GICR base/size：
+
+| | 代码认为 | mido 实际 |
+|---|---|---|
+| reg[2..3] | GICR（redistributor） | **GICC**（CPU 接口） |
+| `find_gicr_pe_base()` | 每 `GICR_PE_SIZE` 读一次 `GICR_TYPER` | 读的是 GICC 的寄存器，全是垃圾 |
+| 结果 | 找不到 Aff1:Aff0 匹配 → `panic` | 就是屏幕那一行 |
+
+我们 ADT 的 `reg = <0xa000000 0x1000 0xa002000 0x2000>`，配合
+`/arm-io` 的 `ranges = <0x0 0x1000000 0xff000000>`（`gSocPhys=0x1000000`），
+算出来正好是绝对地址 `0x0b000000` / `0x0b002000`——**数值是对的，语义错了**。
+
+#### 1.8.3 santoni 的参考实现怎么做的
+
+`ref/ios-santoni/xnu/patches/0017-santoni-gicv2-rtclock.patch` 是三段：
+
+1. `pe_fiq.c`：`#else` 分支（`HAS_GIC_V3=0` 时才是空的）里手写 GICv2：
+   映射 GICD/GICC，`IGROUPR=0xffffffff`、`IPRIORITYR=0xa0a0a0a0`、
+   `ITARGETSR`（前 32 个 INTID 是 per-CPU 只读，从第 8 个字开始写）、
+   `ISENABLER` 打开 vtimer PPI，然后 `GICC_PMR/BPR/CTLR`、`GICD_CTLR`。
+2. `sleh.c`：`#if defined(SANTONI)` 分支读 **`GICC_IAR`（+0x00c）**、
+   回 **`GICC_EOIR`（+0x010）**，取代 `ICC_IAR1_EL1` / `ICC_EOIR1_EL1`。
+3. `protos.h`：把 `sweet_vtimer_intid` / `gicc_base` / `gicd_base` 导出。
+
+他们的 ADT 也是同一套约定：`reg = <0xa000000 0x1000 0xa002000 0x1000>`、
+`ranges` 同我们、`virtual-timer-intid = 0x14`。**mido 的 GICD/GICC 地址和
+santoni 完全一样**，所以数值可以整段照抄。
+
+#### 1.8.4 我们不照抄 `HAS_GIC_V3 0` 的原因
+
+santoni 有自己的板级头（`SANTONI.h` + `MASTER.arm64.santoni`），可以直接把
+`HAS_GIC_V3` 定义成 0。我们不行：`SWEET.h` 是 **polaris 和 mido 共用的**
+（两边都编 `ARM64_BOARD_CONFIG_SWEET`），改成 0 会把能进锁屏的 polaris 一起
+拖下水。
+
+所以 0109 用**运行期判据**：看 ADT 里 `/arm-io/gic` 的 `compatible` 有没有
+`arm,gic-400`。polaris 的 ADT 写的是 `arm,gic-v3`（`tools/mkadt.py:176`），
+所以它走原来的 v3 代码，一个字节都不变；mido 走进新的 v2 分支。
+好处是**同一个内核二进制能同时正确服务两块板**，坏处是要在 `sleh_irq` 里
+把两条取中断的路都编进去（`MRS ICC_IAR1_EL1` 在 GIC-400 上是 UNDEFINED，
+但只是编进去、不执行，clang 对系统寄存器名不做 CPU 校验）。
+
+#### 1.8.5 `virtual-timer-intid`：证据与一个尚未解释的 28
+
+原厂 DTB `/soc/timer`（`arm,armv8-timer`）：
+
+```
+interrupts = <0x1 0x2 0xff08> <0x1 0x3 0xff08> <0x1 0x4 0xff08> <0x1 0x1 0xff08>
+```
+
+第 1 格为 1 = **PPI**，四路依次是 secure-phys (2)、non-secure-phys (3)、
+**virtual (4)**、hyp (1)。PPI 4 → **INTID 16+4 = 20**。santoni 用 20，我们
+`tools/mkadt_mido.py` 也写 20，实测 ADT 字节是 `14000000`（=20）。
+
+可是屏幕打的是 **28**（PPI 12）。而内核文件里 `sweet_vtimer_intid` 的初值
+是 `0x13`（19，`SWEET.h` 的默认值）。19、20、28 三个都对不上，说明
+**被 boot 的那份 payload 的 ADT 跟我在 `out/` 里验的那份不是同一份**
+（Downloads 里的镜像现在也确实不在了，目录里只剩 `shim-boot_unlock.img`）。
+
+所以 0109 不只是修，还**加了取证**：`sweet_gicv2_setup()` 会打出
+`reg` 四格原始值、`soc_base`、映射后的 GICD/GICC 虚拟地址、`GICD_TYPER`
+和 `lines`、以及它读到的 `vtimer`。下次上屏时这些数字会直接指认到底
+哪一步跟预期不符，不用再猜。
+
+#### 1.8.6 0109 / 0110 改了什么
+
+| 补丁 | 文件 | 内容 |
+|---|---|---|
+| 0109 | `pexpert/arm/pe_fiq.c` | `sweet_gicv2` / `sweet_gicd_base` / `sweet_gicc_base`；`sweet_dt_compat_has()`；`sweet_gicv2_percpu()`（PMR/BPR/CTLR/GICD_CTLR，per-CPU banked）；`sweet_gicv2_setup()`（映射 + 分发器编程 + 打开 vtimer PPI + 取证打印）；`pe_init_fiq()` 开头判 v2 直接做 per-CPU 并返回，`!gicd_base` 分支里判到 `arm,gic-400` 就走 v2 并 return |
+| 0109 | `osfmk/arm64/sleh.c` | 新增 `sweet_gic_eoi()`；`sleh_irq` 先按 `sweet_gicv2` 决定用 `GICC_IAR` 还是 `ICC_IAR1_EL1`，三处 EOI 统一走 `sweet_gic_eoi()` |
+| 0109 | `pexpert/pexpert/arm/protos.h` | 导出上面三个变量 |
+| 0110 | `iokit/Kernel/arm/SweetCPU.cpp` | 自 IPI 在 v2 上改走 `GICD_SGIR = (2<<24) | SWEET_IPI_SGI`（self 过滤）；跨 CPU SGI 还没做映射，直接 panic 说明，不静默 UNDEF |
+
+两个补丁都用 `git apply --check` 在"0003/0004/0017/0018/0065/0078/0105 依次
+回放"的树上验过（`out/mkctx.sh` 那套上下文树的做法见 §1.7）。
+
+#### 1.8.6b 两个本地小工具（这次现造的）
+
+- `~/ios-port/syntax0109.c` + `~/ios-port/syn.sh`：把 0109 新增的几个函数
+  连同桩声明单独编一遍（`-target aarch64-freestanding`），在付 25 分钟 CI
+  之前先抓拼写/类型错误。**坑**：这套环境里能用的 zig 是 *Windows* 版
+  （`shim/build.sh` 的 glob 先命中 `zig.exe`），它解析不了 `/home/...` 或
+  `/tmp` 这类路径，会报 `BadPathName`；必须把源文件复制到 `/mnt/c/...` 下、
+  `cd` 过去、再用相对路径。
+- `~/ios-port/symval.py`：按符号名找到段/节，再从文件里取出初值。这一轮就是
+  靠它确认内核文件里 `sweet_vtimer_intid` 的初值是 `0x13`（19），从而判定
+  "屏幕上的 28 只能来自 ADT/别的镜像"，而不是编译器把常量折错了。
+
+#### 1.8.7 下一步要看什么
+
+1. 屏幕上应出现 `SWEET GICv2: soc 0x1000000 gicd ... gicc ... typer 0x???? lines ? vtimer 20`；
+2. 如果 `vtimer` 不是 20，或 GICD/GICC 地址不是 `0x0b000000`/`0x0b002000`，
+   那就是 ADT 的问题，按打印去修 ADT，不用改内核；
+3. 如果这行之后继续往下走（`PE_init` 之后的 IOKit / BSD 阶段），第一个
+   真中断（虚拟定时器 PPI 20）会打到 `sleh_irq` 的 v2 分支上，那时应该能看到
+   `rtclock_intr` 起搏；
+4. 再往后才是 eMMC 根后端（santoni 的 `0142-santoni-sdhci-emmc-driver.patch`
+   已经在 `ref/ios-santoni` 里，地址改成 core `0x07824900` / HC `0x07824000`）。
+
 ## 2. 交付物一览
 
 ```
