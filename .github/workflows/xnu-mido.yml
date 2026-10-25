@@ -113,6 +113,14 @@ jobs:
           # frames before panicking, and adds marks 10/11 around the two calls
           # that run between stage 4 and stage 5.
           cp xnu/patches-mido/0105-*.patch dxb/patches/ 2>/dev/null || true
+          # 0107-* takes the last two ARMv8.1 features away from the kernel.
+          # SWEET.h stops claiming PSTATE.PAN (a Cortex-A53 has none, and
+          # __builtin_arm_rsr("pan") kills clang's backend outright with
+          # `Invalid register name "pan"`), and commpage_asm.s stops grabbing
+          # the pfz lock with the LSE `casa`, which needs +lse to assemble.
+          # Both are hardening/optimisation dead weight on this core.  It has
+          # to sort after 0102, whose SWEET.h hunk rewrites the lines below.
+          cp xnu/patches-mido/0107-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch
