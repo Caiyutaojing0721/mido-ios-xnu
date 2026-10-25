@@ -101,6 +101,14 @@ jobs:
           # trusts it, moves the mark band one row above the start.s crumbs and
           # adds a stage 0 before boot_args is dereferenced.
           cp xnu/patches-mido/0104-*.patch dxb/patches/ 2>/dev/null || true
+          # 0105-* answers the first real question the console asked.  The 0104
+          # kernel dies on an undefined instruction at 0xfffffff00872b5b0, which
+          # is 0x2dd288 bytes past __LINKEDIT: control reached RAM nobody loaded,
+          # and the address alone does not say whether that was a wild return or
+          # a wild indirect call.  0105 dumps pc/lr/sp/fp/esr/far/elr and five
+          # frames before panicking, and adds marks 10/11 around the two calls
+          # that run between stage 4 and stage 5.
+          cp xnu/patches-mido/0105-*.patch dxb/patches/ 2>/dev/null || true
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
