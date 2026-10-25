@@ -858,6 +858,48 @@ PAN 的那几行；0107 的 SWEET.h hunk 是对 **post-0102** 文件做的 diff�
 结论：**A53 上是"去掉 v8.1 的可选项"，不是"换个 -march"**。同一类地雷还有
 `HAS_GIC_V3 1`（mido 是 GIC-400，v2）——那个编译期不报错，是运行期的坑，见第 7 节。
 
+#### 1.4.2 编过了：208 处 LSE → 5 处，且 5 处都点名了
+
+`bcf49c1`（0107 + `-mcpu=cortex-a53+crypto`）**编译成功**，内核
+`kernel.development.sweet` 17,176,144 B，sha256 `e77e6fb5…7d176b`，
+`FLAGS.txt` 里编译器实际拿到的是 `-mcpu=cortex-a53+crypto`，`PATCHES.txt` 里
+**没有**任何 mido 补丁被跳过。
+
+`tools/check_lse.py` 的对比：
+
+```
+_lck_grp_reference 0xfffffff0072bb410
+  b40000a1 885f7c28 11000508 88097c28 35ffffa9 ...   <- cbz / ldaxr / add / stxr / cbnz
+__TEXT_EXEC 里剩下的 in-place LSE: 5（原来是 208）
+```
+
+原来那一处 `b8280028 ldadd w8, w8, [x1]`（panic 元凶）已经变成 LL/SC 循环。
+
+剩下的 5 处全在 `libfirehose_kernel`：
+
+| 地址 | 指令 | 符号 |
+|---|---|---|
+| `…7260188` | `78290109` | `_firehose_buffer_ring_enqueue+0x4c` |
+| `…7260300` | `f82811a8` | `_firehose_buffer_tracepoint_reserve_slow+0x114` |
+| `…7260398` | `f8283128` | `_firehose_buffer_stream_chunk_install+0x70` |
+| `…7260a0c` | `f8280128` | `___firehose_buffer_tracepoint_flush+0x18` |
+| `…7260af0` | `f8680128` | `___firehose_merge_updates+0xb8` |
+
+**为什么它们没跟上**：`libfirehose_kernel` 根本不由 XNU 的 makefile 编译。dxb 单独跑
+`xcodebuild -target libfirehose_kernel -sdk macosx ARCHS="x86_64 arm64e"`（我们的
+workflow 把 ARCHS 扩成 `x86_64 arm64e arm64`），它走自己的 xcconfig，
+`MACHINE_FLAGS_ARM64_SWEET` 传不进去，所以对象文件还是 arm64e（ARMv8.3）基线。
+
+**为什么可以先不管**：这 5 条都在 firehose 的 tracepoint 预留/刷写路径上，只有在有
+消费者在排空 firehose 缓冲区（用户态 logd 之类）时才会执行，早期启动不会碰到。
+于是 `check_lse.py` 改成：**逐条打印符号+偏移**，只把 `firehose_*` 当作具名例外放行，
+其它任何位置命中仍然判失败——旧的"数到 5 就红"只说明数量，不说明它在不在启动路径上，
+这个区分才是关键。
+
+如果哪天真在 `_firehose_*` 里 UNDEF（屏幕会打出该地址），修法已经清楚：把那个
+`xcodebuild` 的 arm64 切片也加上 `-mcpu=cortex-a53+crypto`（改 dxb 里那份
+`libfirehose_kernel.xcconfig`），而不是去动内核。
+
 
 ## 2. 交付物一览
 
