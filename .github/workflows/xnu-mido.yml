@@ -72,6 +72,10 @@ jobs:
           # 0099-* maps the splash V=P again, adds a post-MMU magenta
           # breadcrumb and points the low vectors at a red-block painter, so
           # an early fault is visible instead of looking like a freeze.
+          # 0100-* rewrites those two post-MMU breadcrumbs with compile-time
+          # geometry: 0099's versions read boot_args through a physical pointer
+          # that is only valid with the MMU off, so the probe could fault on
+          # its own first load and look exactly like SCTLR_EL1 failing.
           # All of them sort after the shared patches, which is required. The
           # context-based display patch (0094) is applied MANUALLY against the
           # xnu tree (see docs/MIDO.md); it is deliberately NOT auto-applied.
@@ -80,6 +84,7 @@ jobs:
           cp xnu/patches-mido/0097-*.patch dxb/patches/ 2>/dev/null || true
           cp xnu/patches-mido/0098-*.patch dxb/patches/ 2>/dev/null || true
           cp xnu/patches-mido/0099-*.patch dxb/patches/ 2>/dev/null || true
+          cp xnu/patches-mido/0100-*.patch dxb/patches/ 2>/dev/null || true
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh

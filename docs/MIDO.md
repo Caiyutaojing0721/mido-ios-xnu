@@ -645,6 +645,50 @@ tools/mkpatch_mido_mmu_trace.py   # 合成树导出 diff + 逐字节回放
 tools/check_mmu_trace_asm.py      # 单独汇编向量表与 painter，并检查 16 个槽位都是合法 b
 ```
 
+#### 1.6.10 第五次上机：还是白 + 绿 + 黄 —— 观测点自毁（`0100`）
+
+`0099` 打在 0099 v2 内核上，真机底部仍然只有**白、绿、黄**，洋红缺席。但这次不能再得出
+「`MSR SCTLR_EL1` 炸了」的结论，因为复核代码时发现 `0099` 的两个后置进度块开头是：
+
+```asm
+ldr     x9, [x20, #40]          /* Video.v_baseAddr */
+```
+
+`x20` 是 `boot_args` 的**物理**指针，MMU 关闭时可以直接解引用；MMU 打开后这条 `ldr` 要走
+页表。于是「MMU 起来了吗」这个探针的**第一条指令**自己就可能 data abort——而低向量表的 VA
+若同时不可取指，异常就会二次失败，屏幕上什么都不留。
+
+也就是说「白绿黄」至少有三种解释，而 0099 无法区分：
+
+1. `msr sctlr_el1` / `isb` 本身出错；
+2. MMU 开了，但 `ldr [x20, #40]` 走页表失败；
+3. 前两块写进了写缓冲/cache，没有到达 DRAM（洋红块之后没有 `dsb`）。
+
+这就是把观测代码写得依赖被观测对象本身的下场。`0100-mido-mmu-const-crumbs.patch` 因此：
+
+1. **两个后置块全部改成编译期常量**，与 painter 同一套路：`0x905D6700`（第 1888 行）
+   `+ 288*4`（洋红，x=384px）/ `+ 384*4`（青，x=512px），**在第一条 `str` 之前一条 `ldr`
+   都没有**，不碰 `x20`、不读 `Video`。
+2. **每块末尾加 `dsb sy`**，把 Normal-NC 的写缓冲排空。
+3. **修掉青色写错**：`0x00FFFF00` 在这个小端 BGR 排列的 24bpp 屏上是**黄**（字节 `00 FF FF`），
+   真正的青是 `0x0000FFFF`（字节 `FF FF 00`）。
+
+现在的判读是干净的：
+
+| 底部一行 | 含义 |
+| --- | --- |
+| 白 + 绿 + 黄 | `MSR SCTLR_EL1` 或 `isb` 本身出错（唯一可能） |
+| … + 洋红 | MMU 已开，V=P 映射真实有效 |
+| … + 青 | `CPACR_EL1` / `TPIDR_EL1` / `MIDR_EL1` 都过了，`ret` 进 C 之前 |
+| 上方出现红块 | 取了异常；块位置 = 向量号，再上一带 = `ESR_EL1.EC` |
+
+验证：
+
+```sh
+tools/mkpatch_mido_mmu_const.py   # 生成 0100：从 out/p99 树导出 diff + 逐字节回放
+tools/check_const_crumbs.py       # 抽出两个块单独汇编（含 MOV64 宏），防止手写错
+```
+
 ## 2. 交付物一览
 
 ```
@@ -660,6 +704,8 @@ tools/mkpatch_mido_early.py             # 生成 0098：合成树导出 diff + �
 tools/check_early_asm.py                # 把 start.s 里两段进度块单独汇编
 tools/mkpatch_mido_mmu_trace.py         # 生成 0099：splash V=P 映射 + 洋红/青块 + 带编号的异常 painter
 tools/check_mmu_trace_asm.py            # 单独汇编向量表/painter，校验 16 个槽位可跳
+tools/mkpatch_mido_mmu_const.py         # 生成 0100：两个后置进度块改常量几何 + dsb + 修青色
+tools/check_const_crumbs.py             # 抽出 0100 的两块单独汇编（自带 MOV64 宏）
 xnu/patches-mido/0094-mido-display-scaling.patch   # iPhone X 画布按高度缩放进 1080×1920
 xnu/patches-mido/0095-mido_board.patch             # bsd/dev/mido_board.c（板型判定）
 xnu/patches-mido/0095-mido_emmc.patch              # bsd/dev/mido_emmc.c（eMMC 门禁 stub）
@@ -668,6 +714,7 @@ xnu/patches-mido/0096-mido-fbcon-24bpp.patch       # fbcon 读 ADT depth、支�
 xnu/patches-mido/0097-mido-early-console.patch     # 引导期控制台：映射 mido 开屏、按 24bpp 画
 xnu/patches-mido/0098-mido-early-console.patch     # 控制台延后到最终映射；start.s 加两段 MMU 前进度块
 xnu/patches-mido/0099-mido-mmu-trace.patch         # splash 的 V=P 映射 + MMU 后洋红块 + 异常红块 painter
+xnu/patches-mido/0100-mido-mmu-const-crumbs.patch  # 后置进度块改常量几何（不读 boot_args）+ dsb + 修青色
 xnu/patches-mido/src/                  # 上述 .c 的参考源（patch 由它生成）
 xnu/patches-mido/mido-hook.sh          # 把 mido 驱动接入 conf/files 与初始化的本地脚本
 shim/emmc.c shim/emmc.h                # 只读 eMMC/SDHCI 探针

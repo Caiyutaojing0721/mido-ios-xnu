@@ -1,0 +1,101 @@
+mido: make the post-MMU breadcrumbs independent of boot_args
+
+0099's two post-MMU breadcrumbs began with
+
+        ldr     x9, [x20, #40]          /* Video.v_baseAddr */
+
+reading boot_args through the physical pointer that is only valid while the MMU
+is off.  After SCTLR_EL1 that load goes through the page tables, so the probe
+could fault on its own first instruction -- indistinguishable on the panel from
+SCTLR_EL1 faulting, which is the ambiguity the probe exists to remove.
+
+Rewrite both breadcrumbs with compile-time mido geometry (1080x1920, stride
+3240, 24bpp, band at row 1920-32 -> 0x905D6E00), no loads before the first
+store, and a trailing dsb sy so the Normal-NC writes reach the bus.
+
+Fix the second colour too: 0x00FFFF00 is yellow in this BGR-ordered 24bpp
+framebuffer, cyan is 0x0000FFFF.
+
+    white + green + yellow        SCTLR_EL1 or the isb faults
+    ... + magenta                 the MMU is up and V=P is real
+    ... + cyan                    the return into C is reached
+
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 4473f58..6a97e7c 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -986,19 +986,12 @@ common_start:
+ 
+ 	/*
+ 	 * Breadcrumb (the MMU is now on).
+-	 * Still a physical store, so it only lands if the V=P mapping is real.
++	 * V=P must be real for this to land.
++	 * Compile-time geometry: after SCTLR_EL1 no load may happen before
++	 * the first store, or a page-table miss here would masquerade as the
++	 * MMU write itself failing.
+ 	 */
+-	ldr		x9, [x20, #40]			/* Video.v_baseAddr */
+-	cbz		x9, 1f
+-	ldr		x4, [x20, #56]			/* Video.v_rowBytes */
+-	cbz		x4, 1f
+-	ldr		x2, [x20, #72]			/* Video.v_height */
+-	cmp		x2, #32
+-	b.lo	1f
+-	sub		x2, x2, #32
+-	madd	x9, x2, x4, x9
+-	mov		x3, #288
+-	add		x9, x9, x3, lsl #2
++	MOV64	x9, 0x905D6B80
+ 	mov		w1, #0x00FF00FF
+ 	mov		x2, #32
+ 2:	mov		x3, #64
+@@ -1006,9 +999,10 @@ common_start:
+ 3:	str		w1, [x5], #4
+ 	subs	x3, x3, #1
+ 	b.ne	3b
+-	add		x9, x9, x4
++	add		x9, x9, #3240
+ 	subs	x2, x2, #1
+ 	b.ne	2b
++	dsb		sy
+ 1:
+ 
+ #if !VMAPPLE && !defined(SWEET)
+@@ -1062,29 +1056,23 @@ common_start:
+ 
+ 	/*
+ 	 * Breadcrumb (past CPACR/TPIDR/MIDR).
+-	 * Control reached the return into C, so the MMU write and the three system registers after it all survived.
++	 * The return into C is reached.
++	 * Compile-time geometry: after SCTLR_EL1 no load may happen before
++	 * the first store, or a page-table miss here would masquerade as the
++	 * MMU write itself failing.
+ 	 */
+-	ldr		x9, [x20, #40]			/* Video.v_baseAddr */
+-	cbz		x9, 1f
+-	ldr		x4, [x20, #56]			/* Video.v_rowBytes */
+-	cbz		x4, 1f
+-	ldr		x2, [x20, #72]			/* Video.v_height */
+-	cmp		x2, #32
+-	b.lo	1f
+-	sub		x2, x2, #32
+-	madd	x9, x2, x4, x9
+-	mov		x3, #384
+-	add		x9, x9, x3, lsl #2
+-	mov		w1, #0x00FFFF00
++	MOV64	x9, 0x905D6D00
++	mov		w1, #0x0000FFFF
+ 	mov		x2, #32
+ 2:	mov		x3, #64
+ 	mov		x5, x9
+ 3:	str		w1, [x5], #4
+ 	subs	x3, x3, #1
+ 	b.ne	3b
+-	add		x9, x9, x4
++	add		x9, x9, #3240
+ 	subs	x2, x2, #1
+ 	b.ne	2b
++	dsb		sy
+ 1:
+ 
+ #if KASAN
