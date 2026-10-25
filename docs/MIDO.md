@@ -810,9 +810,53 @@ CI 侧除了跑上面这条，还会在构建后检查 `build.log` 里有没有
 `-march`（`FLAGS.txt`）和被跳过的补丁（`PATCHES.txt`）一起推到 `ci-latest` 分支，
 这样不用 GitHub token 也能核对内核到底是不是按这棵树的意图编出来的。
 
-遗留问题：`-march=armv8-a+crypto` 保留了 `+crypto`。A53 的 crypto 扩展是可选
+遗留问题：`-mcpu=cortex-a53+crypto` 保留了 `+crypto`。A53 的 crypto 扩展是可选
 的，如果这颗 8953 没实现，将来跑 AES/SHA 时会再报一次 UNDEF——到那时看
 `MIDR_EL1` / `ID_AA64ISAR0_EL1` 就能定夺。
+
+
+### 1.4.1 钉到 ARMv8.0 之后：内核里还有两处硬写 v8.1
+
+`-mcpu=cortex-a53+crypto` 这一版（commit `dc35094`）**构建失败**。失败原因是从
+`ci-log` 孤儿分支的 `errors.txt` 读出来的（run log 本身不可下载，见 1.4 节末尾那两条通道）：
+
+```
+fatal error: error in backend: Invalid register name "pan".
+    -> copyio.o / pcb.o / platform_tests.o
+osfmk/arm/commpage/commpage_asm.s:276:2: error: instruction requires: lse
+osfmk/arm/commpage/commpage_asm.s:326:2: error: instruction requires: lse
+```
+
+两处都是**我们自己声明错了**，不是编译器的问题：
+
+1. **PAN。** `pexpert/pexpert/arm64/SWEET.h`（由 `0004` 创建）里写着
+   `#define __ARM_PAN_AVAILABLE__ 1`，于是 `osfmk/arm64/{copyio,pcb,platform_tests}.c`
+   会调 `__builtin_arm_rsr("pan")` / `__builtin_arm_wsr("pan", …)`；clang 后端在
+   展开 `llvm.read_register` 时找不到名为 `pan` 的目标寄存器，直接
+   `report_fatal_error`（旧版 clang 报 `Invalid register name "pan"`，新版报
+   `invalid register "pan" for llvm.read_register`，同一个根因）。
+   **PSTATE.PAN 是 ARMv8.1 的位，A53 上没有**，所以 `msr PAN, #1` 在真机上同样是
+   UNDEFINED——这不是"编不过"，是这颗核确实没有这个加固特性。
+   注意 clang 自己也**不会**为 cortex-a53 定义 `__ARM_PAN_AVAILABLE__`
+   （用本地 clang 探过：`-mcpu=cortex-a53` 下该宏未定义），所以罪魁就是我们这个板级头。
+2. **`casa`。** `osfmk/arm/commpage/commpage_asm.s` 的 `_pfz_trylock_and_enqueue` /
+   `_pfz_trylock_and_dequeue` 用 `casa w10, w11, [x3]` 抢 pfz 锁，汇编器要求 `+lse`。
+   XNU 的 `machine_routines_asm.s:765` 里同一类临界区是
+   `#if defined(__ARM_ARCH_8_2__)` 双路的，唯独 commpage 这一份没写 fallback。
+
+`xnu/patches-mido/0107-mido-armv8-zero-baseline.patch` 一次处理两处：
+
+- `SWEET.h`：`__ARM_PAN_AVAILABLE__` 改成 0，连带关掉 `msr PAN` 的启用；
+- `commpage_asm.s`：两条 `casa` 换成 `ldaxr` / `stxr` 循环，**契约不变**
+  （w10 = 读到的锁字，w11 = 1 = 上锁），原来的 `cbz w10, ..._success` 继续负责判定
+  成功，`stlr wzr` 继续负责释放。
+
+顺序有要求：0107 必须排在 `0102`（4K 页）之后，因为 `0102` 重写了 `SWEET.h` 里紧邻
+PAN 的那几行；0107 的 SWEET.h hunk 是对 **post-0102** 文件做的 diff（已用
+`git apply --check` 在两种基线上验过）。
+
+结论：**A53 上是"去掉 v8.1 的可选项"，不是"换个 -march"**。同一类地雷还有
+`HAS_GIC_V3 1`（mido 是 GIC-400，v2）——那个编译期不报错，是运行期的坑，见第 7 节。
 
 
 ## 2. 交付物一览
