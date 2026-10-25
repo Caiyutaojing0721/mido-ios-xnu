@@ -777,16 +777,26 @@ UNDEF pc=0xfffffff0072b55b0 instr=0xb8280028 esr=0x02000000
 执行它必然是 UNDEFINED。xnu 里没有任何 `__ARM_FEATURE_ATOMICS` 门控，也没有手写
 LSE 汇编，所以唯一的杠杆是编译目标架构。
 
-正确值写在 `xnu/patches/0004-sweet-machine-config.patch` 新增的那一行：
+正确值写在 `xnu/patches/0004-sweet-machine-config.patch` 新增的那一行（它是**创建**
+该变量的补丁，所以一定生效）：
 
 ```
-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET  -march=armv8-a+crypto
+MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET  -mcpu=cortex-a53+crypto
 ```
 
-这是**创建**该变量的补丁，所以一定生效。（曾经用后置的 0106 去改这一行，结果
-dxb 的补丁循环对 `git apply --check` 失败只打 warning，补丁被静默跳过，内核
-字节级完全没变 —— 见下面的守门。）polaris/sweet 是 ARMv8.2，退回 armv8-a 只损失
-LSE 这个优化，LL/SC 在所有 ARMv8.0+ 核上都正确。
+两个坑，都是实测撞出来的：
+
+1. **`-march=` 在 Darwin arm64 上是空转的。** 先试 `-march=armv8.2-a+crypto` →
+   `-march=armv8-a+crypto`，编译成功但内核可执行段**逐字节没变**（差异全在
+   `__CTF` 和版本串），`ldadd` 原地不动。`.CFLAGS` 里 `-march` 排在 `-arch arm64`
+   之前，实际决定 CPU 的是后者。要换用 `-mcpu=`（同族的 T8101/T8103/T6000 就是这么写的）。
+2. **`-mcpu=cortex-a53` 会编不过。** LLVM 的 A53 模型不含 crypto，而
+   `osfmk/arm64/corecrypto/arm64_isa_compatibility.h` 里的内联汇编硬写了
+   `aesmc.16b` / `aesimc.16b`，汇编器直接报 `instruction requires: aes`。
+   所以补上 `+crypto`：`-mcpu=cortex-a53+crypto`。
+
+polaris/sweet 是 ARMv8.2，退回 ARMv8.0 只损失 LSE 这个优化，LL/SC 在所有
+ARMv8.0+ 核上都正确。
 
 守门两条，缺一不可：
 
