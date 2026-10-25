@@ -1000,6 +1000,53 @@ GIC-400 上这些要么写进不存在的 MMIO、要么直接 UNDEFINED。参考
 所以只照抄宏定义不够，得给它们补 `HAS_GIC_V3` 分支。
 这件事放到 1850 过关之后做：先拿到"过了 arm_vm_init"这个事实，再动中断。
 
+#### 1.7.5 修正：GIC 在初始化路径上其实没有炸（别再盲改）
+
+1.7.4 写完当天，我从**编出来的内核二进制**里查了一遍调用关系，结论跟推演不一样：
+
+```
+_pe_init_fiq  @ 0xfffffff007a5e910
+  <- _PE_init_cpu+0x24          (尾部 b，不是 bl)
+_fiq_context_init @ 0xfffffff00742ebb0
+  <- _arm_init+0xabc, _arm_init_cpu+0x8c, _arm_init_idle_cpu+0x44
+```
+
+`pe_init_fiq()` 唯一的直接调用者是 `PE_init_cpu()`，而 `PE_init_cpu()` 由
+`arm_init_cpu()` 调。屏幕已经打到 `SWEET EARLY 6: cpu_init done`，也就是
+**CPU0 上 `pe_init_fiq()` 已经完整执行过、没有 panic**。所以：
+
+- `HAS_GIC_V3 1` 在这条初始化路径上"没炸"（`find_gicr_pe_base()` 在 reg 只有
+  两个 cell 时会走到"没有 GICR"的分支，whatever 它做了什么，反正没 panic）；
+- 把它写成"下一个坑"是**过度推演**，特此更正；
+- 真正**仍未验证**的是取中断那一步：`osfmk/arm64/sleh.c` 里
+  `#if defined(SWEET)` 用 `ICC_IAR1_EL1` / `ICC_EOIR1_EL1`，这在 GIC-400 上是
+  UNDEFINED（v2 走 MMIO 的 GICC_IAR）。这一条只有等第一次真中断（虚拟定时器
+  PPI 19）到来时才会暴露，届时屏幕会打出 `_sleh_irq` / `_sleh_fiq` 附近的
+  `instr=` 值，用不着猜。
+
+**所以：不要让 GIC 变成"顺手改一改"的实验。** 一次盲改要花 20 分钟 CI + 一次
+上机，而现在的现场（1850 断言）还没被证伪。
+
+#### 1.7.6 0108 编出来的内核（第一份带着新锚点的镜像）
+
+| 项 | 值 |
+|---|---|
+| 提交 | `6d659c4`（0108 + workflow 拷贝行），CI 分支 `bd2ad91` |
+| `kernel.development.sweet` | 17,159,760 B，sha256 `2381cf0d b2b79c87 f08bd0a5 90979dd5 e83e5ce0 d573a1fc 1e812756 317d0589` |
+| `FLAGS.txt` | `-mcpu=cortex-a53+crypto`（未变，`MakeInc.def:64` 生效） |
+| `PATCHES.txt` | 仍只有 dxb 自带的 4 个上游补丁被跳，0108 已应用 |
+| 镜像 | `shim-mido-xnu-gz.img`，16,814,080 B，sha256 `1d6bfa54 3bb935ee 9cdebae2 f1be06f9 275f3d22 f37a08fd 81db6de6 fdf99ecf` |
+
+10 项 pipeline 自检全过：gz→Image 225,280 B 吻合、尾部是原厂 DTB（msm-id
+`0x125` 在 `0x3335`）、payload 与 ramdisk 逐字节相同、ADT 10,764 B 已嵌入、
+payload 段与内核段一一对应、0099 向量表在 `__TEXT_EXEC+0x1c9000`、洋红/青标记
+在 `+0x1ca5ac` / `+0x1ca604`。
+
+**内核字节确认换过**（不是"编了但没变"）：与上一份镜像里的 payload 逐段比对，
+`__TEXT` 与 `__TEXT_EXEC` 都出现了**整体位移**（`bl` 目标普遍差 0x1000），
+说明 `arm_vm_init.c` 的代码长度真的变了——这正是 0108 应有的表现。对照
+0.4 节那两次"绿但字节不变"的假成功，这一次是有位移的。
+
 ## 2. 交付物一览
 
 ```
