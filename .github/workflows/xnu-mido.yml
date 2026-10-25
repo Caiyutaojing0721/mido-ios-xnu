@@ -217,8 +217,15 @@ jobs:
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
       # A Cortex-A53 traps on every ARMv8.1 atomic, so a single stray `ldadd`
-      # means a kernel that boots to an undefined-instruction panic.  0106
-      # narrows -march; this checks the bytes instead of trusting the flag.
+      # means a kernel that boots to an undefined-instruction panic.  The
+      # target flag is -mcpu=cortex-a53+crypto (0004); this checks the bytes
+      # instead of trusting the flag.
+      #
+      # One known exception: libfirehose_kernel is not built by the XNU
+      # makefiles (dxb runs `xcodebuild -target libfirehose_kernel` with its
+      # own xcconfig), so MACHINE_FLAGS_ARM64_SWEET never reaches it and its
+      # five atomics keep the arm64e baseline.  check_lse.py names them and
+      # lets them through; anything else still fails the job.
       - name: Verify the kernel has no ARMv8.1 atomics
         run: |
           test -f out/kernel.development.sweet || { echo "no kernel built"; exit 0; }
