@@ -1178,6 +1178,121 @@ interrupts = <0x1 0x2 0xff08> <0x1 0x3 0xff08> <0x1 0x4 0xff08> <0x1 0x1 0xff08>
 4. 再往后才是 eMMC 根后端（santoni 的 `0142-santoni-sdhci-emmc-driver.patch`
    已经在 `ref/ios-santoni` 里，地址改成 core `0x07824900` / HC `0x07824000`）。
 
+### 1.9 kmem_range_init：4K 内核装不下 128GB 的 zone 窗口（0111/0112）
+
+中断通了之后，屏幕是这样的（节选，2026-10-26）：
+
+```
+SWEET GICv2: soc 0x1000000 gicd 0xfffffff00561de00 gicc 0xfffffff00561df00 typer 0x000004ea lines 11 vtimer 20
+SWEET GIC: virtual timer INTID 20
+Darwin Kernel Version 22.6.0: Mon Aug 14 05:06:07 UTC 2023; runner: xnu-8796.141.3
+pmap_startup() init/release time: 27276 microsec
+vm_page_bootstrap: 151822 free pages, 12018 wired pages
+VM bootstrap: 73 maps, 153 entries and 128 holes available
+panic(cpu 0 caller 0xfffffff007aa939c): kmem_range_init: vm_map_locate_space failing for claim zones @//vm_kern.c/:3645
+```
+
+先记两件事，都是好消息：
+
+- **GIC-400 这条路彻底通了**。`typer 0x4ea` → ITLinesNumber = 10 → 352 个 IRQ，`lines 11`；`vtimer 20`
+  正是原厂 DTB `/soc/timer` 的 PPI 4 + 16，也就是 santoni 用的那个值。上一节那个"INTID 28"
+  这次没有出现，说明被 boot 的就是我们新编的 payload。
+- `vm_page_bootstrap: 151822 free pages` + `12018 wired` = 163840 页 × 4KB = 640MB = ADT 里的
+  `dram-size 0x28000000`，一个字节不差。
+
+#### 1.9.1 根因：`ZONE_MAP_VA_SIZE` 编成了 128 GiB
+
+`kmem_range_init()` 会为每一段内核 VA 用途（`zones`、`zone_meta`、`compressor`、
+`ipc_kernel_map`、`io_submap`、4 个 `gIOKitPageableFixed*`、`kmem_ptr_range`…）在
+`kernel_map` 里找一块连续空位。**第一条就是 `zones`，它要 `ZONE_MAP_VA_SIZE` 那么大。**
+
+`osfmk/kern/zalloc.c` 里这个宏有两套值：
+
+```c
+#if XNU_PLATFORM_MacOSX
+#define ZONE_MAP_MAX            (32ULL << 30)
+#define ZONE_MAP_VA_SIZE        (128ULL << 30)
+#else
+#define ZONE_MAP_MAX            (8ULL << 30)
+#define ZONE_MAP_VA_SIZE        (24ULL << 30)
+#endif
+```
+
+这套 dxb 构建带着 `XNU_PLATFORM_MacOSX`，于是拿到的是 **128 GiB**。
+而 4KB 页的 arm64 内核只有：
+
+| 项 | 值 |
+|---|---|
+| `VM_MIN_KERNEL_ADDRESS` | `0xffffffe000000000` |
+| `VM_MAX_KERNEL_ADDRESS` | `0xfffffffbffffffff` |
+| 合计 | **112 GiB** |
+| 内核镜像 | `0xfffffff006000000`（`LOW_GLOBAL+96MB`，正好卡在中间） |
+| 镜像以下的那块洞 | **≈64 GiB** |
+| `zones` 要的 | **128 GiB** |
+
+**128 > 112，永远放不进去**，所以失败的必然是 `zones`，而且不可能靠挪地址绕开。
+
+#### 1.9.2 这个结论是从我们自己的二进制里读出来的，不是推的
+
+光看源码只能知道"可能是 macOS 分支"。`_zone_set_map_sizes` 在符号表里是有地址的
+（`0xfffffff007a9ef08`），直接反汇编就对上了：
+
+```
++0x78  f2c00109  movk x9, #0x8, lsl 32     ; 0x8_00000000 = 32 GiB  (ZONE_MAP_MAX)
++0x104 d2c0040c  movz x12, #0x20, lsl 32   ; 0x20_00000000 = 128 GiB (ZONE_MAP_VA_SIZE)
+```
+
+顺带一个交叉验证：屏幕上的 `caller 0xfffffff007aa939c` 就是本地内核里
+`_kmem_range_init` 的符号地址，**逐字节相同**。也就是说被 boot 的那份内核和我手上这份
+是同一份，前面几节关于"CI 绿了但内核没变"的担心在这里不成立。
+
+#### 1.9.3 修法：照 santoni 的做法，取紧凑窗口
+
+santoni 也是 4KB 内核，也有这个问题，它的 `0097-santoni-zone-va-size.patch` 就是把
+`ZONE_MAP_MAX/VA_SIZE` 钉成 8 GiB / 24 GiB。
+
+`0111-mido-zone-va-size.patch` 做同样的事，但不用板级宏（我们的 mido 和 polaris 共用
+`ARM64_BOARD_CONFIG_SWEET`，没有可用的编译期区分），而是**直接让 macOS 分支失效**：
+
+```c
+#define SWEET_COMPACT_ZONE_VA 1
+#if XNU_PLATFORM_MacOSX && !SWEET_COMPACT_ZONE_VA
+```
+
+因为补丁本身放在 `xnu/patches-mido/`，只有 mido 的构建会拿到它，polaris 一个字节都不动。
+
+24 GiB 够不够？`ZONE_MAP_MAX` 仍然是 8 GiB，而这块板只有 640MB 内存，zone 实际能用到的
+远小于 1 GiB；24 GiB 只是地址空间，不占内存。`zone_meta_size` 会从
+`atop(128GiB)×sizeof(meta)`（≈805MB 的 claim）降到 ≈151MB，这本身也是好事。
+
+#### 1.9.4 0112：让下一次失败自己带数字
+
+`kmem_range_init` 原来的 panic 只打 claim 名字，遇到"放不下"完全看不出差多少。0112 改成：
+
+```
+panic(cpu 0: kmem_range_init: no space for claim zones: size 0x600000000 hint 0x... map 0xffffffe000000000-0xfffffffbffffffff claims N)
+```
+
+并在 claims 循环之前打一行：
+
+```
+SWEET KMEM: map 0xffffffe000000000-0xfffffffbffffffff largest_free 0x... claims 0x... n 12
+```
+
+三个数字（洞多大、要多少、一共几条 claim）足以判断是"窗口太小"还是"哪条 claim 太大"。
+
+#### 1.9.5 下一关在哪
+
+`kmem_range_init` 之后按 `STARTUP` 顺序还有 `zone_bootstrap`、VM 的其余子系统、
+`IOKit` 初始化、BSD init，最后是 **根设备**。根设备是 mido 已知的最大缺口：
+
+- 仓库里只有 UFS 的根后端（`0028-sweet-ufs-root-device.patch`，给 polaris 用）；
+- `xnu/patches-mido/0095-mido_emmc.patch` 只有 83 行，是个 stub；
+- santoni 的 `0142-santoni-sdhci-emmc-driver.patch`（2828 行）是可以照搬的实现，
+  地址换成 mido 的 core `0x07824900` / HC `0x07824000` 即可。
+
+所以在看到屏幕之前，不提前动 eMMC——但这就是 1.9 之后的第一顺位。
+
 ## 2. 交付物一览
 
 ```
