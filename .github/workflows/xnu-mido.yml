@@ -51,6 +51,10 @@ jobs:
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
     runs-on: macos-14
     timeout-minutes: 120
+    # the kernel is pushed back to the ci-latest branch so the machine doing the
+    # packaging can fetch it without a GitHub login (artifacts need one)
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -169,3 +173,23 @@ jobs:
           name: xnu-kernel-mido
           path: out/
           if-no-files-found: warn
+
+      # Downloading an artifact of a private repo needs a GitHub login, which
+      # the packaging machine does not have. Push the kernel to a single-commit
+      # orphan branch instead: it is readable over the same SSH key that
+      # already pushes patches, and force-pushing keeps one commit of history.
+      - name: Publish kernel to ci-latest
+        if: always()
+        run: |
+          test -f out/kernel.development.sweet || { echo "no kernel built"; exit 0; }
+          git config user.email ci@mido.local
+          git config user.name "mido ci"
+          git checkout -q --orphan ci-latest-tmp
+          git rm -rq --cached . >/dev/null 2>&1 || true
+          cp out/kernel.development.sweet kernel.development.sweet
+          cp out/SHA256SUMS SHA256SUMS 2>/dev/null || true
+          printf '%s\n' "$GITHUB_SHA" > BUILT_FROM
+          git add -f kernel.development.sweet SHA256SUMS BUILT_FROM
+          git commit -qm "ci: kernel from $GITHUB_SHA"
+          git push -f origin HEAD:ci-latest
+          echo "published $(shasum -a 256 kernel.development.sweet)"
