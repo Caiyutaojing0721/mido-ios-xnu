@@ -756,6 +756,55 @@ tools/check_mido_4k_asm.py   # 抽出四块映射单独汇编，核 4 条 str �
 早期控制台开始出字（因为 MMU 通了，内核终于能走到 `arm_vm_init`）。
 
 
+## 1.4 目标架构必须钉在 ARMv8.0：A53 没有 LSE
+
+这条是实测踩出来的，比页大小更隐蔽。
+
+早期控制台跑到 stage 11 后崩：
+
+```
+UNDEF pc=0xfffffff0072b55b0 instr=0xb8280028 esr=0x02000000
+0xfffffff0072b55b0 -> _lck_grp_reference (+0x8)
+```
+
+`0xb8280028` 是 ARMv8.1 的 LSE 原子指令 `ldadd w8, w8, [x1]`（把
+`__atomic_add_fetch(p,1,relaxed)` 喂给 `-march=armv8.2-a` 的 clang 就会生成
+`52800028 mov w8,#1` + `b8280008 ldadd w8,w8,[x0]`）。它来自
+`osfmk/kern/lock_group.c` 的 `lck_grp_reference()` 里第一次
+`os_atomic_inc(cnt, relaxed)`。
+
+**Cortex-A53 是 ARMv8.0-A，没有 LSE**（也没有 CRC32 / RDMA / FP16 算术），
+执行它必然是 UNDEFINED。xnu 里没有任何 `__ARM_FEATURE_ATOMICS` 门控，也没有手写
+LSE 汇编，所以唯一的杠杆是编译目标架构。
+
+正确值写在 `xnu/patches/0004-sweet-machine-config.patch` 新增的那一行：
+
+```
+MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET  -march=armv8-a+crypto
+```
+
+这是**创建**该变量的补丁，所以一定生效。（曾经用后置的 0106 去改这一行，结果
+dxb 的补丁循环对 `git apply --check` 失败只打 warning，补丁被静默跳过，内核
+字节级完全没变 —— 见下面的守门。）polaris/sweet 是 ARMv8.2，退回 armv8-a 只损失
+LSE 这个优化，LL/SC 在所有 ARMv8.0+ 核上都正确。
+
+守门两条，缺一不可：
+
+```sh
+tools/check_lse.py <kernel>   # 查 _lck_grp_reference 前 12 条 + 统计 __TEXT_EXEC 里 in-place LSE
+                              # 0105 内核实测：+0x8 = b8280028、全段 208 处
+```
+
+CI 侧除了跑上面这条，还会在构建后检查 `build.log` 里有没有
+`Skipping patch .../0094-0199-*`，有就判失败；并把编译器实际拿到的
+`-march`（`FLAGS.txt`）和被跳过的补丁（`PATCHES.txt`）一起推到 `ci-latest` 分支，
+这样不用 GitHub token 也能核对内核到底是不是按这棵树的意图编出来的。
+
+遗留问题：`-march=armv8-a+crypto` 保留了 `+crypto`。A53 的 crypto 扩展是可选
+的，如果这颗 8953 没实现，将来跑 AES/SHA 时会再报一次 UNDEF——到那时看
+`MIDR_EL1` / `ID_AA64ISAR0_EL1` 就能定夺。
+
+
 ## 2. 交付物一览
 
 ```

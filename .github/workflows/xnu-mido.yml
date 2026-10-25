@@ -221,9 +221,14 @@ jobs:
           cp out/SHA256SUMS SHA256SUMS 2>/dev/null || true
           printf '%s\n' "$GITHUB_SHA" > BUILT_FROM
           # Publish what the compiler was actually told, so the packaging side
-          # can verify the target ISA without a GitHub login.
-          grep -o 'march=[^ ]*' dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/.CFLAGS \
-            > FLAGS.txt 2>/dev/null || echo "no .CFLAGS found" > FLAGS.txt
+          # can verify the target ISA without a GitHub login.  .CFLAGS holds a
+          # NUL byte, so strip it first or grep calls the file binary.
+          {
+            tr -d '\0' < dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/.CFLAGS \
+              | grep -ao -- '-m[a-z]*=[^ ]*' | tr '\n' ' '
+            echo
+            grep -n 'MACHINE_FLAGS_ARM64_SWEET' dxb/xnu/makedefs/MakeInc.def
+          } > FLAGS.txt 2>/dev/null || echo "no .CFLAGS found" > FLAGS.txt
           grep 'Skipping patch' dxb/build.log > PATCHES.txt 2>/dev/null \
             || echo "no patch was skipped" > PATCHES.txt
           cat FLAGS.txt PATCHES.txt
