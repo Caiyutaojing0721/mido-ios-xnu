@@ -162,6 +162,23 @@ jobs:
           fi
           echo "all mido patches applied"
 
+      # Downloading run logs of a private repo needs a token we do not have, so
+      # when a build breaks, keep the tail of the log on its own orphan branch.
+      - name: Publish build log on failure
+        if: failure()
+        run: |
+          test -f dxb/build.log || exit 0
+          git config user.email ci@mido.local
+          git config user.name "mido ci"
+          git checkout -q --orphan ci-log-tmp
+          git rm -rq --cached . >/dev/null 2>&1 || true
+          tail -c 400000 dxb/build.log > build.log.tail
+          printf '%s\n' "$GITHUB_SHA" > BUILT_FROM
+          git add -f build.log.tail BUILT_FROM
+          git commit -qm "ci: build log tail from $GITHUB_SHA"
+          git push -f origin HEAD:ci-log
+          echo "published the log tail to the ci-log branch"
+
       - name: Package build tree for local compiles
         if: always()
         run: |
