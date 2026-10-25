@@ -113,6 +113,13 @@ jobs:
           # frames before panicking, and adds marks 10/11 around the two calls
           # that run between stage 4 and stage 5.
           cp xnu/patches-mido/0105-*.patch dxb/patches/ 2>/dev/null || true
+          # 0106-* is the answer 0105's dump produced.  The undefined instruction
+          # was 0xb8280028 == `ldadd w8, w8, [x1]`, an ARMv8.1 LSE atomic, in
+          # lck_grp_reference+8: a Cortex-A53 is ARMv8.0-A and has no LSE.  The
+          # machine config asked for -march=armv8.2-a+crypto (right for SWEET and
+          # polaris, wrong here); narrow it to armv8-a so os_atomic_* lowers to
+          # load-exclusive/store-exclusive pairs.
+          cp xnu/patches-mido/0106-*.patch dxb/patches/ 2>/dev/null || true
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
@@ -166,6 +173,14 @@ jobs:
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+
+      # A Cortex-A53 traps on every ARMv8.1 atomic, so a single stray `ldadd`
+      # means a kernel that boots to an undefined-instruction panic.  0106
+      # narrows -march; this checks the bytes instead of trusting the flag.
+      - name: Verify the kernel has no ARMv8.1 atomics
+        run: |
+          test -f out/kernel.development.sweet || { echo "no kernel built"; exit 0; }
+          python3 tools/check_lse.py out/kernel.development.sweet
 
       - uses: actions/upload-artifact@v4
         if: always()
