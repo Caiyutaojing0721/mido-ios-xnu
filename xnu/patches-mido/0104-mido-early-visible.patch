@@ -1,0 +1,119 @@
+mido: make the early console visible before arm_vm_init
+
+The 0103 kernel gets past SCTLR_EL1: the panel shows all five breadcrumbs --
+white from the shim, green and yellow from 0098 before the MMU, magenta and
+cyan from 0100 after it -- and then nothing, forever.
+
+That silence is 0098's doing.  It gated sweet_early.c on early_fb_live, which
+only sweet_early_relocate() sets, and that call sits deep inside arm_vm_init().
+The gate was correct when the bootstrap V=P mapping of the panel was an
+unverified guess: a store through an unmapped VA at that point is fatal and
+would have been indistinguishable from the fault the probe was looking for.
+
+The breadcrumbs have since settled that question.  start.s writes 0x905D6B80
+and 0x905D6D00 through the bootstrap mapping with the MMU already on, and both
+land on screen.  The mapping is real, so the blanket silence now only destroys
+information: a fault in the jump out of start.s, in boot_args, in
+PE_init_platform()'s ADT walk and in arm_vm_init()'s page-table rebuild all
+produce the identical picture.
+
+  * sweet_early.c: drop the early_fb_live gate from put/putc/mark.  Before
+    relocation the console uses the bootstrap V=P mapping; afterwards it uses
+    the kernel alias exactly as before.  Panic output is visible throughout,
+    which matters because PE_init_platform() panics on a malformed ADT and
+    that panic is currently invisible.
+
+  * sweet_early_mark(): draw the band one row above the start.s crumbs
+    (y = HEIGHT-64 rather than HEIGHT-32), so the bottom row keeps the five
+    start.s colours and the row above counts arm_init's own progress.
+
+  * arm_init.c: mark stage 0 before boot_args is dereferenced.  Stage 0
+    without stage 1 means the jump landed and boot_args is what faults; no
+    stage 0 at all means the jump -- the KVA bootstrap mapping -- never
+    arrived.
+
+Read the bottom row as the start.s status and the row above as arm_init's
+progress: no stage 0 means the KVA tables are wrong, 0 without 1 means
+boot_args is unreachable, 1 without 2 means the ADT, 7 without 8 means
+arm_vm_init()'s rebuild, and 8 or more means the kernel's own panel alias is
+live.
+
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 4aef58b..66c63f4 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -347,6 +347,13 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++	/*
++	 * Stage 0 runs before boot_args is touched.  With the KVA alias live but
++	 * the panel reachable only through the bootstrap V=P mapping, "0 visible,
++	 * 1 missing" means the jump out of start.s landed and boot_args is what
++	 * faults, while "nothing at all" means the jump never arrived.
++	 */
++	sweet_early_mark(0, "arm_init reached, boot_args untouched");
+ 	sweet_early_init(args);
+ 	sweet_early_mark(1, "arm_init entered (MMU on)");
+ 
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 2d79d95..43053b9 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -16,9 +16,19 @@ static unsigned int early_width = 1080, early_height = 1920;
+ static unsigned int early_stride = 3240, early_bpp = 3;
+ 
+ /*
+- * The bootstrap page tables are not known to cover the panel, and an
+- * unmapped write is fatal this early. Stay silent until arm_vm_init()
+- * has installed a real alias and calls sweet_early_relocate().
++ * early_fb_live is set by sweet_early_relocate() once arm_vm_init() has
++ * installed the kernel's own alias for the panel.
++ *
++ * Before relocation the console goes through the bootstrap V=P mapping that
++ * start.s builds (0x90000000-0x907FFFFF, four 2MB blocks at 4KB pages).
++ * 0098 stayed silent because that mapping was then an unverified guess and an
++ * unmapped store is fatal this early.  The start.s breadcrumbs at 0x905D6B80
++ * and 0x905D6D00 are written through exactly that mapping with the MMU on, so
++ * it is now a measured fact rather than a guess -- and staying silent only
++ * makes every hang between start.s and arm_vm_init() look the same.
++ *
++ * The pre-relocation band is drawn one row above the start.s crumbs so the two
++ * sets stay readable apart.
+  */
+ static unsigned int early_fb_live;
+ #define EARLY_FB early_fb
+@@ -42,9 +52,6 @@ sweet_early_put(unsigned int x, unsigned int y, uint32_t color)
+ {
+ 	volatile uint8_t *p;
+ 
+-	if (!early_fb_live) {
+-		return;
+-	}
+ 	p = EARLY_FB + (uintptr_t)y * EARLY_STRIDE + (uintptr_t)x * early_bpp;
+ 
+ 	if (early_bpp == 4) {
+@@ -99,7 +106,7 @@ sweet_early_clear_row(void)
+ void
+ sweet_early_putc(char c)
+ {
+-	if (early_disabled || !early_fb_live) {
++	if (early_disabled) {
+ 		return;
+ 	}
+ 	if (!early_started) {
+@@ -146,11 +153,12 @@ sweet_early_string(const char *s)
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
+-	if (early_disabled || !early_fb_live || stage > 20) {
++	if (early_disabled || stage > 20) {
+ 		return;
+ 	}
+ 	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+-	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
++	/* The bottom 32 rows belong to the start.s crumbs; stay above them. */
++	for (unsigned int y = EARLY_HEIGHT - 64; y < EARLY_HEIGHT - 32; y++) {
+ 		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
+ 			sweet_early_put(x, y, color);
+ 		}
