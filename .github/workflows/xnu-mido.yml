@@ -121,6 +121,13 @@ jobs:
           # Both are hardening/optimisation dead weight on this core.  It has
           # to sort after 0102, whose SWEET.h hunk rewrites the lines below.
           cp xnu/patches-mido/0107-*.patch dxb/patches/ 2>/dev/null || true
+          # 0108-* moves the early framebuffer alias into the L1 slot that
+          # arm_vm_init() actually allocates.  0083 anchors it at
+          # VM_MIN_KERNEL_ADDRESS + one L2 entry, which only shares a slot with
+          # gVirtBase in the 16KB/large-memory layout; with 4KB pages it lands
+          # 4GB+96MB away in an L1 entry nothing ever fills, and
+          # arm_vm_init.c:1850 asserts.  Same panel, several 2MB blocks.
+          cp xnu/patches-mido/0108-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch

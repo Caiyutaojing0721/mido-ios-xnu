@@ -1,0 +1,134 @@
+mido: put the early framebuffer alias in an L1 slot arm_vm_init fills
+
+The first self-built 4KB kernel booted past stage 11 and died at
+arm_vm_init.c:1850:
+
+  SWEET EARLY PANIC: arm_vm_init.c:1850 Assertion failed:
+  ((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) ==
+   (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE))
+
+0083 places the framebuffer alias at VM_MIN_KERNEL_ADDRESS +
+ARM_TT_L2_SIZE and asserts its L1 entry is already a table.  That
+invariant only holds in the ARM_LARGE_MEMORY layout SWEET uses, where
+VM_MIN_KERNEL_ADDRESS is the low-globals base and, with 16KB pages, one
+L1 entry spans 64GB -- so VM_MIN+32MB shares an L1 slot with gVirtBase
+and got a table for free.
+
+mido runs 4KB pages: an L1 entry spans 1GB, VM_MIN_KERNEL_ADDRESS is
+0xffffffe000000000 while gVirtBase is 0xfffffff006000000, so
+VM_MIN+2MB lands in L1 slot 384 and gVirtBase in slot 448.  Slot 384
+was never allocated and is still ARM_TTE_EMPTY at the assert.
+
+Anchor the alias at the base of gVirtBase's own L1 slot plus one L2
+entry instead, and map as many L2 blocks as the panel needs: one 2MB
+block cannot cover a 6.2MB 1080x1920x3 splash buffer, and the console
+would fault the moment it scrolled past the first 2MB.
+
+Unchanged on the 16KB boards: there gVirtBase & ~(64GB-1) is the same
+low-globals base 0083 used, the panel needs one 32MB block, and the
+block count clamp keeps the mapping below gVirtBase.
+
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1829,31 +1829,91 @@
+ /*
+  * The reserved low-globals/kernel region is excluded from VM allocation.
+- * Use the otherwise empty 32MB block above low globals and below gVirtBase
+- * for a Normal-NC framebuffer alias that survives bootstrap TTBR0 teardown.
++ * Use the otherwise empty entries directly below gVirtBase for a Normal-NC
++ * framebuffer alias that survives bootstrap TTBR0 teardown.
++ *
++ * The alias must live in the *same L1 slot as gVirtBase*, not at a fixed
++ * distance from VM_MIN_KERNEL_ADDRESS:
++ *
++ *  - arm_vm_init() only allocates L1 tables for [gVirtBase, ...).  A VA in any
++ *    other L1 slot is still ARM_TTE_EMPTY here, and the assert below fires.
++ *    With 16KB pages an L1 entry spans 64GB and VM_MIN_KERNEL_ADDRESS (SWEET's
++ *    -2TB layout, VM_MIN == low globals) shares gVirtBase's slot, so
++ *    `VM_MIN + 32MB' happened to work.  mido runs 4KB pages, where an L1 entry
++ *    spans 1GB and VM_MIN_KERNEL_ADDRESS is 0xffffffe000000000, i.e. 4GB+96MB
++ *    below gVirtBase -- a slot nothing ever fills.  That is exactly the
++ *    arm_vm_init.c:1850 assertion.
++ *  - the L2 page is per-L1-entry, so anchoring here also guarantees that the
++ *    L2 page we index exists and is zeroed.
++ *
++ * One L2 entry is a 2MB block with 4KB pages (32MB with 16KB), so the alias has
++ * to cover several of them: mido's splash buffer is 1080x1920 at 3 bytes per
++ * pixel, 6.2MB in total, while a single 2MB block used to be enough on the
++ * 16KB boards.
+  */
+ #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
++#define SWEET_EARLY_FB_MAX_BLOCKS 16
+ 
+ static vm_map_address_t sweet_early_fb_va = SWEET_EARLY_FB_VA;
+ 
+ static void
+ sweet_early_map_final(boot_args *args)
+ {
+-	const vm_map_address_t va = SWEET_EARLY_FB_VA;
++	/* base of the L1 slot holding gVirtBase, stepped one L2 entry up */
++	const vm_map_address_t va =
++	    (gVirtBase & ~(vm_map_address_t)ARM_TT_L1_OFFMASK) + ARM_TT_L2_SIZE;
++	const vm_map_address_t l1_limit =
++	    gVirtBase & ~(vm_map_address_t)(ARM_TT_L2_SIZE - 1);
+ 	uint64_t fb = 0x9c000000ULL;
++	uint64_t fb_bytes = 0;
++	unsigned int nblocks = 1;
++
+ 	if (args != NULL && args->Video.v_baseAddr != 0) {
+ 		fb = args->Video.v_baseAddr;
+ 	}
++	if (args != NULL && args->Video.v_rowBytes != 0 && args->Video.v_height != 0) {
++		fb_bytes = (uint64_t)args->Video.v_rowBytes * (uint64_t)args->Video.v_height;
++	}
+ 	uint64_t block = fb & ~((uint64_t)ARM_TT_L2_SIZE - 1);
+ 	sweet_early_fb_va = va + (vm_map_address_t)(fb - block);
+-	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
++
++	if (fb_bytes != 0) {
++		uint64_t need = (fb - block) + fb_bytes;
++		nblocks = (unsigned int)((need + ARM_TT_L2_SIZE - 1) / ARM_TT_L2_SIZE);
++	}
++	if (nblocks < 1) {
++		nblocks = 1;
++	}
++	/*
++	 * With 4KB pages an L2 entry is 2MB, and the early console's row pitch is
++	 * not always the panel's (24bpp splash buffers get a 4-byte-per-pixel
++	 * console), so keep a few blocks of slack.  The 16KB boards keep the
++	 * historical single 32MB block and must not grow: their L1 slot only has
++	 * room for three.
++	 */
++	if (ARM_TT_L2_SIZE < (16ULL << 20)) {
++		nblocks += 5;
++	}
++	if (nblocks > SWEET_EARLY_FB_MAX_BLOCKS) {
++		nblocks = SWEET_EARLY_FB_MAX_BLOCKS;
++	}
++	/* never touch the L2 entry that carries the kernel's own static mapping */
++	while ((nblocks > 1) &&
++	    ((va + ((vm_map_address_t)nblocks * ARM_TT_L2_SIZE)) > l1_limit)) {
++		nblocks--;
++	}
++	assert(va + ((vm_map_address_t)nblocks * ARM_TT_L2_SIZE) <= l1_limit);
++
+ 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+-	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = block | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+-	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+-	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+-	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	for (unsigned int i = 0; i < nblocks; i++) {
++		assert(slot[i] == ARM_TTE_EMPTY);
++		slot[i] = (block + ((uint64_t)i * ARM_TT_L2_SIZE)) |
++		    ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	}
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
