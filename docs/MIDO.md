@@ -901,6 +901,105 @@ workflow 把 ARCHS 扩成 `x86_64 arm64e arm64`），它走自己的 xcconfig，
 `libfirehose_kernel.xcconfig`），而不是去动内核。
 
 
+### 1.7 自建内核第一次上机：arm_vm_init.c:1850
+
+0090 之后第一次让**自建内核**（而不是 santoni 的参考 payload）跑起来，屏幕给出的第一手数据是：
+
+```
+SWEET EARLY 7: entering arm_vm_init
+SWEET EARLY PANIC: arm_vm_init.c:1850 Assertion failed:
+((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE))
+```
+
+**这不是我们新引入的 bug，是 0083 的一条隐含前提在 4KB 页下不成立。**
+
+#### 1.7.1 那个 `l1` 是什么
+
+`arm_vm_init.c:1850` 在 `sweet_early_map_final()` 里（`xnu/patches/0083-sweet-polaris-early-fb.patch`）：
+
+```c
+#define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
+...
+tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+```
+
+它想拿「低全局区到 gVirtBase 之间那段空窗」做一个 framebuffer 的 VA 别名（Normal-NC、
+WRITECOMB），这样 bootstrap TTBR0 拆掉之后控制台还能继续输出。断言的含义是：
+**这个 VA 所在的那张 L1 表已经被 `init_ptpages()` 建好了。**
+
+#### 1.7.2 为什么 16KB 成立、4KB 不成立
+
+`arm_vm_init()` 只给 `[gVirtBase, dynamic_memory_begin)` 这一段分配 L1 表
+（`init_ptpages(cpu_tte, gVirtBase, dynamic_memory_begin, ...)`，第 2020 行）。
+所以一个 VA 要能被这条断言接受，唯一的条件是**它和 gVirtBase 落在同一个 L1 项里**。
+
+| | 16KB 页（sweet / polaris） | 4KB 页（mido） |
+|---|---|---|
+| L1 一项覆盖 | 64GB | **1GB** |
+| `VM_MIN_KERNEL_ADDRESS` | `0xfffffe0000000000`（ARM_LARGE_MEMORY，−2TB，正好是 low globals） | `0xffffffe000000000`（−128GB） |
+| `ARM_TT_L2_SIZE` | 32MB | 2MB |
+| 别名 VA | `VM_MIN + 32MB` | `VM_MIN + 2MB` = `0xffffffe000200000` |
+| gVirtBase | `0xfffffe0006000000` | `0xfffffff006000000` |
+| → L1 槽位 | **同一个**（224） | **384 vs 448，不同** |
+
+16KB 那边之所以一直没事，是因为 `VM_MIN + 32MB` 与 `gVirtBase` 只差 96MB，
+而 L1 项有 64GB，纯属**搭上了顺风车**。4KB 那边两者差 4GB+96MB（`0x100600000`），
+跨了两个 L1 槽，`cpu_tte[384]` 从头到尾没人写过，仍是 `ARM_TTE_EMPTY` → 断言炸。
+
+验算（`python3` 直接算，不靠脑算）：
+
+```
+mido    gVirtBase 0xfffffff006000000  L1 slot 448  L2 slot 48
+        alias     0xffffffe000200000  L1 slot 384  L2 slot 1      <- 不同槽，EMPTY
+```
+
+顺带一个必须一起解决的次生问题：**一个 L2 项在 4KB 下只有 2MB**。
+mido 的面板是 1080×1920×3B = 6.2MB，就算断言放过，也只映射到前 2MB，
+控制台一旦写过去就是 data abort——症状会从"断言"变成"无声死机"。
+
+#### 1.7.3 0108 怎么修
+
+`xnu/patches-mido/0108-mido-early-fb-in-allocated-l1-slot.patch`：
+
+1. **锚点改成 `gVirtBase` 自己的 L1 槽**，而不是离 `VM_MIN_KERNEL_ADDRESS` 固定偏移：
+
+   ```c
+   const vm_map_address_t va =
+       (gVirtBase & ~(vm_map_address_t)ARM_TT_L1_OFFMASK) + ARM_TT_L2_SIZE;
+   ```
+
+   L2 页是跟着 L1 项走的，所以这样既保证 L1 是 table，也保证要写的那张 L2 存在且已清零。
+2. **按面板大小映射多个 L2 block**：`nblocks = ceil((fb - block + rowBytes*height) / ARM_TT_L2_SIZE)`，
+   上限 16 项，并且**夹住不让它碰到 gVirtBase 所在的那一项**（`l1_limit`）。
+3. 4KB 下再留 5 个 block 的余量（早期控制台的行距不一定等于面板行距，24bpp 面板上
+   控制台按 4B/像素走），16KB 板子完全不受影响。
+
+跑出来的结果：
+
+| | L1 槽 | 用的 L2 槽 | block 数 | 覆盖 | 物理范围 |
+|---|---|---|---|---|---|
+| mido | 448（= gVirtBase） | 1..8（gVirtBase 在 48） | 8 | 16MB | `0x90000000..0x90ffffff` |
+| polaris | 224（= gVirtBase） | 1..1（gVirtBase 在 3） | 1 | 32MB | `0x9c000000..0x9dffffff` |
+
+polaris 那一行与 0083 原来完全一致——这是这次改动**必须**成立的性质，
+否则等于拿一个能进锁屏的板子去赌一块没验证过的板子。
+
+#### 1.7.4 仍然没解决的下一个坑：GIC
+
+`SWEET.h` 里 `HAS_GIC_V3 1`，而 mido 是 **GIC-400（v2）**：GICD `0x0B000000`、
+GICC `0x0B002000`、没有 GICR。更要紧的是 sweet 这套补丁把 v3 的访问方式**写死**了：
+
+- `pexpert/arm/pe_fiq.c` 用 `gicr_write32(GICR_*)` —— redistributor 是 v3 才有的；
+- `osfmk/arm64/sleh.c` 用 `ICC_IAR1_EL1` / `ICC_EOIR1_EL1` 系统寄存器取中断号。
+
+GIC-400 上这些要么写进不存在的 MMIO、要么直接 UNDEFINED。参考实现
+`ref/ios-santoni/xnu/patches/0085-santoni-board-target.patch` 的做法是
+`HAS_GIC_V3 0` + `SWEET_VTIMER_INTID 20` + `SWEET_IPI_SGI 1`，但那几个
+`#if defined(SWEET)` 块在 santoni 自己的 0004 里**同样存在**（同样写死 v3），
+所以只照抄宏定义不够，得给它们补 `HAS_GIC_V3` 分支。
+这件事放到 1850 过关之后做：先拿到"过了 arm_vm_init"这个事实，再动中断。
+
 ## 2. 交付物一览
 
 ```
