@@ -228,6 +228,9 @@ if __name__ == '__main__':
                     help='require Polaris/SDM845 eight-node ADT and one contiguous cpus=1..8 prefix')
     ap.add_argument('--mido', action='store_true',
                     help='use the Redmi Note 4X (mido) default command line if --cmdline is unchanged')
+    ap.add_argument('--cpus', type=int, metavar='N',
+                    help='override the cpus=N boot arg (mido default is 4; use 1 to keep '
+                         'secondary-CPU bring-up out of the way while chasing another bug)')
     ap.add_argument('--check-mido-cpus', action='store_true',
                     help='require mido/MSM8953 eight A53 nodes and one contiguous cpus=1..8 prefix')
     a = ap.parse_args()
@@ -241,6 +244,12 @@ if __name__ == '__main__':
         print(f'Polaris CPU prefix {selected}/8 validated (CPU_ON not verified)')
     if a.mido and a.cmdline == 'debug=0xc serial=3 cpus=1 keepsyms=1':
         a.cmdline = MIDO_CMDLINE
+    if a.cpus is not None:
+        import re
+        new_cmdline, n = re.subn(r'\bcpus=\d+', 'cpus=%d' % a.cpus, a.cmdline)
+        if n != 1:
+            ap.error('--cpus: the command line has %d cpus= occurrences' % n)
+        a.cmdline = new_cmdline
     if a.check_mido_cpus:
         from mido_cpu_topology import TopologyError, validate as mido_validate
         try:

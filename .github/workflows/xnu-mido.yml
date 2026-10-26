@@ -150,6 +150,14 @@ jobs:
           # bounds) instead of only the claim name, and prints the free / claim
           # totals one line earlier.  Diagnostics only; no behaviour change.
           cp xnu/patches-mido/0112-*.patch dxb/patches/ 2>/dev/null || true
+          # 0113-* fixes the SMP topology check for MSM8953.  0078 encoded
+          # SM7150's MPIDR layout (core in Aff1, Aff0 == 0); mido is
+          # Cluster.Aff1 : Core.Aff0, so the first secondary died in it:
+          #   SWEET CPU: invalid topology cpu=1 mpidr=0x1 count=4
+          # Cluster 1 still cannot start (start.s indexes CpuDataEntries[] with
+          # MPIDR & 0xffff, ml_processor_register() with the logical id), so the
+          # check now accepts cluster 0 up to four cores and says so explicitly.
+          cp xnu/patches-mido/0113-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch
