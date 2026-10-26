@@ -241,6 +241,17 @@ jobs:
           # never found by check_np.  Map at the nominal addresses instead and
           # let dyld derive a slide of zero.  srslide=1 restores the old path.
           cp xnu/patches-mido/0123-*.patch dxb/patches/ 2>/dev/null || true
+          # 0124: keep a backup of the HFS+ volume header.  The volume header
+          # is the one metadata block HFS+ never journals, so a power cut
+          # while it is being rewritten leaves a volume that cannot even be
+          # opened ("hfs_ValidateHFSPlusVolumeHeader: unknown Volume
+          # Signature : 6174", "cannot mount root, errno = 19") and the only
+          # way back is reflashing 16 GiB.  Mirror the last good header into
+          # the last sectors of the "userdata" partition (they are past the
+          # end of the 16 GiB volume), restore it before the mount, fall back
+          # to the alternate header at the volume end, and refuse to send a
+          # header write whose payload is not a plausible volume header.
+          cp xnu/patches-mido/0124-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch

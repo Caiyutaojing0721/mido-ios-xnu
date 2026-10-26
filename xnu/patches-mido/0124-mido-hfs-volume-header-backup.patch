@@ -1,0 +1,309 @@
+--- a/bsd/dev/mido_sdhci.c
++++ b/bsd/dev/mido_sdhci.c
+@@ -317,6 +317,10 @@
+ #define CMD6_BUSY_TIMEOUT_NS    (1ull * NSEC_PER_SEC)
+ #define WRITE_PROGRAM_TIMEOUT_NS (2ull * NSEC_PER_SEC)
+ 
++/* --------------------------------------------------- HFS+ volume header */
++#define VHDR_LBA                2u      /* 1024 / 512: primary header sector */
++#define VHDR_BACKUP_SECTORS     8u      /* mirror lives in the last 8 sectors */
++
+ static struct {
+ 	vm_offset_t regs;                       /* core base, HC at +0x900 */
+ 	vm_offset_t gcc;                        /* GCC sdcc1_apps RCG page */
+@@ -341,6 +345,13 @@
+ 	bool verify_writes;                     /* boot-arg sdhciverify (default on) */
+ 	uint32_t verify_fails;                  /* blocks whose read-back differed */
+ 	uint32_t cache_size;                    /* EXT_CSD CACHE_SIZE, 256 KiB units */
++	uint64_t vhdr_lba;                      /* HFS+ primary header, absolute */
++	uint64_t mirror_lba;                    /* header backup, absolute */
++	uint64_t vol_sectors;                   /* boot-arg hfsvolsz, or 0 */
++	bool vhdr_ok;                           /* a valid header has been seen */
++	bool mirror_ok;                         /* backup slot is outside the volume */
++	uint32_t vhdr_writes;                   /* header updates written since boot */
++	uint32_t vhdr_refused;                  /* header writes that were refused */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
+@@ -2296,6 +2307,221 @@
+ 	}
+ }
+ 
++/*
++ * HFS+ volume-header protection (0124).
++ *
++ * The volume header is the one piece of metadata HFS+ does not journal. If
++ * the card is still programming that 4 KiB block when power is pulled -- or
++ * if anything writes a buffer that is not a volume header to lba 2 -- the
++ * volume becomes unreadable before the journal is ever looked at:
++ *
++ *   hfs_ValidateHFSPlusVolumeHeader: unknown Volume Signature : 6174
++ *   hfs_mountfs: hfs_mountfs returned error=22
++ *   cannot mount root, errno = 19
++ *
++ * and the only way back is reflashing the whole 16 GiB root image. On this
++ * board the volume is 16 GiB inside a 54 GiB "userdata" partition, so the
++ * last sectors of the partition are outside the filesystem and free.
++ *
++ * Two measures:
++ *  - a mirror of the last good header sector is kept there, refreshed from
++ *    every header write (throttled: the mirror only has to be a *valid*
++ *    header, the journal replay that follows a restore brings the counters
++ *    forward), and written back at probe when the primary is damaged;
++ *  - a header write whose payload carries no plausible HFS+ signature is
++ *    replaced by the mirror instead of being sent to the card, so a bad
++ *    in-memory buffer can never reach the volume.  It is logged the first
++ *    few times, which also names the culprit.
++ *
++ * If there is no mirror yet, the alternate volume header at the end of the
++ * volume (written by fsck.hfsplus) is used; hfsvolsz=<sectors> says where
++ * the volume ends when it is smaller than the partition.
++ */
++static uint8_t mido_vhdr[SDHCI_BLOCK];
++
++static int mido_sdhci_read_blocks(uint64_t lba, uint32_t count, void *buf);
++
++static inline uint16_t
++mido_be16(const uint8_t *p)
++{
++	return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
++}
++
++static inline uint32_t
++mido_be32(const uint8_t *p)
++{
++	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
++	    ((uint32_t)p[2] << 8) | (uint32_t)p[3];
++}
++
++/*
++ * Size in bytes of the volume this sector describes, or 0 when it is not a
++ * plausible HFS+/HFSX volume header. The bound is the partition, so a stale
++ * copy can never describe a volume larger than the device we are on.
++ */
++static uint64_t
++mido_vhdr_bytes(const uint8_t *s)
++{
++	uint16_t sig = mido_be16(s);
++	uint16_t ver = mido_be16(s + 2);
++	uint32_t block_size = mido_be32(s + 40);
++	uint32_t total = mido_be32(s + 44);
++	uint64_t bytes;
++
++	/* 0x482b = kHFSPlusSigWord 'H+', 0x4858 = kHFSXSigWord 'HX' */
++	if (sig != 0x482b && sig != 0x4858) {
++		return 0;
++	}
++	if (ver != 4 && ver != 5) {
++		return 0;
++	}
++	if (block_size < SDHCI_BLOCK || block_size > 65536 ||
++	    (block_size & (block_size - 1)) != 0) {
++		return 0;
++	}
++	if (total == 0) {
++		return 0;
++	}
++	bytes = (uint64_t)total * block_size;
++	if (bytes > se.nblocks * (uint64_t)SDHCI_BLOCK) {
++		return 0;
++	}
++	return bytes;
++}
++
++/* Caller holds mido_sdhci_lock. */
++static void
++mido_vhdr_mirror_write(const uint8_t *s)
++{
++	if (!se.mirror_ok || !se.writable) {
++		return;
++	}
++	if (sdhci_write_pio((uint32_t)se.mirror_lba, 1, s)) {
++		printf("MIDO SDHCI: could not update the volume header backup "
++		    "at lba 0x%llx\n", (unsigned long long)se.mirror_lba);
++	}
++}
++
++/*
++ * Decide whether the backup slot is usable for a volume of this size: it has
++ * to start at or after the end of the filesystem, otherwise a filesystem
++ * that fills the whole partition would lose its last blocks to the mirror.
++ */
++static void
++mido_vhdr_set_mirror(uint64_t vol_bytes)
++{
++	uint64_t part_bytes = se.nblocks * (uint64_t)SDHCI_BLOCK;
++
++	se.mirror_ok = vol_bytes != 0 && se.nblocks > VHDR_BACKUP_SECTORS &&
++	    vol_bytes + (uint64_t)VHDR_BACKUP_SECTORS * SDHCI_BLOCK <=
++	    part_bytes;
++	if (!se.mirror_ok && vol_bytes != 0) {
++		printf("MIDO SDHCI: the volume fills the partition: no room "
++		    "for a volume header backup\n");
++	}
++}
++
++/* Caller holds mido_sdhci_lock. Adopts s as the good header and restores it. */
++static void
++mido_vhdr_restore(const uint8_t *s, const char *what)
++{
++	uint64_t bytes = mido_vhdr_bytes(s);
++	uint32_t attr;
++
++	memcpy(mido_vhdr, s, SDHCI_BLOCK);
++	se.vhdr_ok = true;
++	/*
++	 * Clear kHFSVolumeUnmountedBit (0x100). A backup describes a volume
++	 * that was not cleanly unmounted, and its freeBlocks/nextCatalogID
++	 * are behind by however long ago it was written; with the bit clear
++	 * hfs_mountfs replays the journal instead of trusting them.
++	 */
++	attr = mido_be32(mido_vhdr + 4) & ~0x00000100u;
++	mido_vhdr[4] = (uint8_t)(attr >> 24);
++	mido_vhdr[5] = (uint8_t)(attr >> 16);
++	mido_vhdr[6] = (uint8_t)(attr >> 8);
++	mido_vhdr[7] = (uint8_t)attr;
++
++	mido_vhdr_set_mirror(bytes);
++	if (!se.writable) {
++		printf("MIDO SDHCI: %s has a valid HFS+ volume header but the "
++		    "device is read-only (emmcrw=0): mount will fail\n", what);
++		return;
++	}
++	if (sdhci_write_pio((uint32_t)se.vhdr_lba, 1, mido_vhdr)) {
++		printf("MIDO SDHCI: could not write the %s header back to "
++		    "lba 0x%llx\n", what, (unsigned long long)se.vhdr_lba);
++		return;
++	}
++	printf("MIDO SDHCI: restored the HFS+ volume header from the %s; "
++	    "the journal has to be replayed over it\n", what);
++	/* Also seed the mirror, so the next repair does not depend on the
++	 * alternate header being present. */
++	mido_vhdr_mirror_write(mido_vhdr);
++}
++
++/* Called with mido_sdhci_lock held, once, right after the partitions are known. */
++static void
++mido_vhdr_init(void)
++{
++	uint8_t *s = (uint8_t *)(se.dma + DMA_BOUNCE);
++	uint64_t bytes;
++	int error;
++
++	se.vhdr_lba = se.first_block + VHDR_LBA;
++	se.mirror_lba = se.first_block + se.nblocks - VHDR_BACKUP_SECTORS;
++
++	error = mido_sdhci_read_blocks(se.vhdr_lba, 1, s);
++	if (error) {
++		printf("MIDO SDHCI: cannot read the HFS+ volume header at "
++		    "lba 0x%llx (%d)\n", (unsigned long long)se.vhdr_lba,
++		    error);
++		return;
++	}
++
++	bytes = mido_vhdr_bytes(s);
++	if (bytes) {
++		memcpy(mido_vhdr, s, SDHCI_BLOCK);
++		se.vhdr_ok = true;
++		mido_vhdr_set_mirror(bytes);
++		mido_vhdr_mirror_write(mido_vhdr);
++		printf("MIDO SDHCI: HFS+ volume header ok (%llu MiB, block "
++		    "size %u)%s\n", (unsigned long long)(bytes >> 20),
++		    mido_be32(s + 40),
++		    se.mirror_ok ? ", backup written" : "");
++		return;
++	}
++
++	printf("MIDO SDHCI: HFS+ volume header at lba 0x%llx is DAMAGED "
++	    "(signature 0x%04x, expected 0x482b/0x4858)\n",
++	    (unsigned long long)se.vhdr_lba, mido_be16(s));
++
++	/* 1. our own mirror, which is the freshest copy there is. */
++	error = se.nblocks > VHDR_BACKUP_SECTORS ?
++	    mido_sdhci_read_blocks(se.mirror_lba, 1, s) : EINVAL;
++	if (!error && mido_vhdr_bytes(s)) {
++		mido_vhdr_restore(s, "backup");
++		return;
++	}
++	printf("MIDO SDHCI: no usable volume header backup at lba 0x%llx\n",
++	    (unsigned long long)se.mirror_lba);
++
++	/* 2. the alternate volume header fsck.hfsplus left at the volume end. */
++	if (se.vol_sectors > 2 && se.vol_sectors <= se.nblocks) {
++		uint64_t alt = se.first_block + se.vol_sectors - 2;
++
++		error = mido_sdhci_read_blocks(alt, 1, s);
++		if (!error && mido_vhdr_bytes(s)) {
++			mido_vhdr_restore(s, "alternate volume header");
++			return;
++		}
++		printf("MIDO SDHCI: no usable alternate volume header at lba "
++		    "0x%llx\n", (unsigned long long)alt);
++	}
++	printf("MIDO SDHCI: the root volume is unrecoverable without a "
++	    "reflash\n");
++}
++
+ static int
+ mido_sdhci_read_blocks(uint64_t lba, uint32_t count, void *buf)
+ {
+@@ -2334,6 +2560,36 @@
+ 		    se.sec_count);
+ 		return EINVAL;
+ 	}
++	if (se.vhdr_lba != 0 && lba <= se.vhdr_lba &&
++	    se.vhdr_lba < lba + (uint64_t)count) {
++		uint8_t *h = (uint8_t *)(uintptr_t)buf +
++		    (size_t)(se.vhdr_lba - lba) * SDHCI_BLOCK;
++
++		if (mido_vhdr_bytes(h)) {
++			memcpy(mido_vhdr, h, SDHCI_BLOCK);
++			se.vhdr_ok = true;
++			se.vhdr_writes++;
++			if ((se.vhdr_writes & 31u) == 1u) {
++				mido_vhdr_mirror_write(mido_vhdr);
++			}
++		} else if (se.vhdr_ok) {
++			se.vhdr_refused++;
++			if (se.vhdr_refused <= 4) {
++				printf("MIDO SDHCI: refusing a bad HFS+ volume "
++				    "header write at lba 0x%llx (signature "
++				    "0x%04x, %02x %02x %02x %02x %02x %02x "
++				    "%02x %02x): keeping the last good one\n",
++				    (unsigned long long)se.vhdr_lba,
++				    mido_be16(h), h[0], h[1], h[2], h[3], h[4],
++				    h[5], h[6], h[7]);
++			}
++			memcpy(h, mido_vhdr, SDHCI_BLOCK);
++		} else if (se.vhdr_refused++ < 4) {
++			printf("MIDO SDHCI: writing an unrecognised HFS+ "
++			    "volume header at lba 0x%llx (signature 0x%04x)\n",
++			    (unsigned long long)se.vhdr_lba, mido_be16(h));
++		}
++	}
+ 	error = sdhci_write_pio((uint32_t)lba, count, buf);
+ 	if (!error) {
+ 		se.writes_pending = true;
+@@ -3001,6 +3257,12 @@
+ 	if (PE_parse_boot_argn("sdhciverify", &rw, sizeof(rw))) {
+ 		se.verify_writes = (rw != 0);
+ 	}
++	/* Size of the HFS+ volume in sectors, for the alternate-header repair
++	 * path when the volume is smaller than its partition (it is: 16 GiB
++	 * inside a 54 GiB "userdata"). 0 means "the whole partition". */
++	if (PE_parse_boot_argn("hfsvolsz", &rw, sizeof(rw)) && rw > 0) {
++		se.vol_sectors = (uint32_t)rw;
++	}
+ 	se.secsize = DEV_BSIZE;
+ 
+ 	se.regs = ml_io_map(reg[0], reg[1]);
+@@ -3038,6 +3300,9 @@
+ 	if (!error) {
+ 		error = mido_sdhci_find_partition(se.part);
+ 	}
++	if (!error) {
++		mido_vhdr_init();
++	}
+ 	lck_mtx_unlock(&mido_sdhci_lock);
+ 	if (error) {
+ 		return error;
