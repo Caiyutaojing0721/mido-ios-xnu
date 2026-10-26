@@ -1455,6 +1455,57 @@ cluster 1 的 CPU interface 映射还没确定，所以仍然 panic，但换成�
 占位符，`0095-mido_emmc.patch` 只有 83 行 stub）。看到 `IOFindBSDRoot` 失败之前，
 eMMC/SD 都不用动。
 
+### 1.12 cpu1 上电成功，但握手没完成（0115）
+
+0114 的 SMP 镜像把最硬的一段走通了：
+
+```
+[0] ml_processor_register>cpu_id ... cpu_number 1/2/3 is type 0
+SWEET FB: no boot framebuffer
+SWEET CPU: requested=4 selected=4 (limit=8)
+cpu_start() cpu: 0
+SWEET CPU: cpu=0 entered initCPU mpidr=0x0 EL1 IRQs=1
+SWEET CPU: cpu=0 mpidr=0x0 came alive; SGI1 OK
+cpu_start() cpu: 1
+SWEET CPU: cpu=1 CPU_ON target=0x1 entry_pa=0x9942a090 context=1
+SWEET CPU: cpu=1 PSCI CPU_ON rc=0
+arm_cpu_init(): cpu 1 online
+SWEET CPU: cpu=1 entered initCPU mpidr=0x1 EL1 IRQs=0
+```
+
+四件事被证实了：**MPIDR 0x1 通过了 0113 的检查**、PSCI `CPU_ON` 返回 0（固件真的把核
+上电了）、cpu1 真的跑到了 `initCPU`、`arm_cpu_init()` 也自报 online。然后就没有了：
+**没有 `cpu=1 ... came alive`，也没有 `cpu_start() cpu: 2`**，而 cpu0 的另一个线程照常
+往下起 `AKS / WDT / SURF / HID / BATTERY` —— 说明卡住的是**握手**，不是复位路径。
+
+#### 1.12.1 握手为什么可能失败
+
+`cpu_data_init()` 给每个 cpu_data 的初值就是 `cpu_signal = SIGPdisabled`，只有真的收到
+一次中断、`cpu_signal_handler()` 把它清掉，`sweet_cpu_signal_is_enabled()` 才为真。
+所以这个握手就是"发一个自 SGI，然后看它有没有被取走"。
+
+在 GICv3 上这是稳的：SGI 挂在 GICR 里，核只要晚点开中断就会取到。GIC-400 不是：
+`GICC_CTLR / GICC_PMR / GICC_BPR` **按 CPU interface 分 bank**，没有 redistributor
+帮它留住 SGI。`initCPU()` 是在 `splsched` 下发的，此时该核 `DAIF.I` 还是置位的
+（日志里 `IRQs=0` 就是证据），于是自 SGI 落在"自己接口还没开"的窗口里。
+
+`pe_init_fiq()` 经由 `PE_init_cpu()` 会为每个核跑一次 `sweet_gicv2_percpu()`，
+理论上盖住了这段——但把整条链押在"`sweet_gicv2` 这个 SECURITY_READ_ONLY_LATE 全局在
+从核进入时已经可见"上太脆，而且一旦丢了 SGI 就没有第二次机会。
+
+#### 1.12.2 0115 的三处改动
+
+- `pe_fiq.c` 导出 `sweet_gicv2_cpu_enable()`（就是原来的 bank 初始化）和
+  `sweet_gicv2_cpu_dump()`（**只读 CTLR/PMR/BPR**——读 `GICC_IAR` 会把活跃中断 ACK 掉）。
+- `SweetCPU::initCPU()` 在 `signalCPU()` 之前先开本核的 CPU interface，发完再把该核
+  读到的 `GICC_CTLR/PMR/BPR` 打出来：**"接口是开的"变成在那一核上量到的事实**。
+- `startAll()` 在"核已 initialized 但没取到 SGI"时每 ~200 ms 重发一次，不再只赌一发；
+  超时行从只有 MPIDR 变成 `init=%u sig=%u resends=%u`。
+- `slave_machine_init()` 加两行心跳（`cpu_machine_init` 之后、`clock_init` 之后），
+  用来区分"核死在 idle 之前"和"核已 idle 但收不到 IPI"。
+
+对 XNU 的契约没变：`ml_cpu_init_completed()` 仍然只在每个选定核都过了同一个等待之后调用。
+
 ## 2. 交付物一览
 
 ```
