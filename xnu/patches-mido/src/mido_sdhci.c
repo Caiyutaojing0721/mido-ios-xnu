@@ -1,30 +1,41 @@
 /*
- * Redmi Note 4X (mido) eMMC 5.1 root-device driver (DIAGNOSTIC MILESTONE).
+ * MIDO internal eMMC 5.1 root device (polled SDHCI MSM v4, SDCC1).
  *
- * mido has eMMC 5.1 on SDCC1 (SDHCI), NOT UFS. This revision is a
- * take-over + register dump only: it maps the SDHCI window the bootloader /
- * ABL left behind, prints the present-state / capabilities / clock / power so
- * the serial console alone tells us whether the host is alive and what the
- * card wants, then refuses to mount (ENXIO) so the boot stalls after the
- * dump instead of panicking. No command is issued yet: the SDHCI command /
- * data path and the eMMC CMD sequence come in the next milestone once we
- * know the host state from this dump.
+ * The Qualcomm LK bootloader already powered, clocked and identified the
+ * internal eMMC through SDCC1 and hands it over in Transfer State (TRAN) on
+ * an 8-bit bus. This driver reuses that state instead of reimplementing the
+ * GCC clock tree and SPMI regulators: it maps the single 0x1000 MMIO window
+ * at 0x07824000 (Qualcomm vendor core registers at +0x000, standard SDHCI
+ * host controller registers at +0x900) and issues polled commands, one at a
+ * time, with PIO transfers through the SDHCI buffer port.
  *
- * Register window (stock boot.img DTB + shim/emmc.c):
- *   /soc/sdhci@7824900  reg = <0x7824900 0x500>  (standard SDHCI set)
- *                       hc-reg = <0x7824000 0x1000> (vendor HC block)
- * The 0x500 core window holds PRESENT_STATE @0x24, CAPABILITIES @0xfc,
- * HOST_CTRL @0x28, PWR_CTRL @0x2c, BLKSZ @0x30, TRANS @0x38, CMD @0x3c.
- * These offsets are the ones shim/emmc.c validated against real hardware.
+ * SDHCI_RESET_ALL (0x01) is issued exactly once, during takeover and before
+ * the card is used: it clears the standard SDHCI register file while the GCC
+ * clocks and the vendor window (HC_MODE, VENDOR_SPEC, DLL) survive. Takeover
+ * then rebuilds HOST_CONTROL/HOST_CONTROL2/TIMEOUT_CONTROL from the hand-off
+ * values and switches the vendor core from the bootloader's legacy MCI mode
+ * into SDHCI HC mode (CORE_HC_MODE, core + 0x78). It selects the free-running
+ * MCLK the HC datapath runs on (CORE_VENDOR_SPEC, HC + 0x10c = 0x07824a0c),
+ * keeps the divider at 0 because GCC owns the card rate and sdhci-msm has no
+ * usable internal divider, and opens the SDHCI card-clock gate. After
+ * takeover only the command and data paths (0x06) are ever reset. All
+ * DMA-free, so the only cache maintenance is the (conservative)
+ * clean/invalidate of the bounce buffer.
  *
- * Modeled on bsd/dev/sweet_ufs.c (the working UFS root in this tree) for the
- * XNU KPI: ml_io_map, SecureDTLookupEntry/SecureDTGetProperty, printf, the
- * bdevsw/cdevsw + devfs + IOFindBSDRoot registration shape.
+ * One GPT partition is found by name (boot-arg emmcroot=, default
+ * "userdata") and exposed as the BSD disk emmcroot0 (remmcroot0 character
+ * device), 512-byte logical sectors. Root on it with rd=emmcroot0. Writes
+ * are refused unless boot-arg emmcrw=1 is given, and always stay inside the
+ * selected partition. The primary GPT header and its partition entry array
+ * are verified with their IEEE 802.3 CRC32 before any entry is trusted.
  *
- * The target GPT partition comes from the "emmcroot=" boot-arg, default
- * "userdata" (project decision: the iOS rootfs lives on userdata).
+ * The "system" partition is parsed as well, but only to give the persistent
+ * console log (xnu/patches/0143) a private 8193-sector area at its start:
+ * mido_sdhci_write_log_blocks() is the one write path that needs neither
+ * emmcrw=1 nor the userdata fence, and it refuses anything outside that area.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
+
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/buf.h>
@@ -33,7 +44,8 @@
 #include <sys/errno.h>
 #include <sys/proc.h>
 #include <sys/uio.h>
-#include <sys/dev.h>
+#include <mach/vm_param.h>
+#include <libkern/copyio.h>
 #include <miscfs/devfs/devfs.h>
 #include <kern/locks.h>
 #include <kern/clock.h>
@@ -41,115 +53,2765 @@
 #include <arm/caches_internal.h>
 #include <vm/pmap.h>
 #include <vm/vm_kern.h>
-#include <mach/vm_types.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
 #include <libkern/libkern.h>
 
+extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
-/* SDHCI standard register window (core). Vendor HC block is at 0x07824000. */
-#ifndef MIDO_SDCC1_CORE
-#define MIDO_SDCC1_CORE		0x07824900UL
-#endif
-#ifndef MIDO_SDCC1_CORE_SIZE
-#define MIDO_SDCC1_CORE_SIZE	0x500UL
-#endif
+/* ------------------------------------------------- SDHCI standard registers */
+#define SDHCI_BLOCK_SIZE        0x04
+#define SDHCI_BLOCK_COUNT       0x06
+#define SDHCI_ARGUMENT          0x08
+#define SDHCI_TRANSFER_MODE     0x0c
+#define SDHCI_COMMAND           0x0e
+#define SDHCI_RESPONSE          0x10
+#define SDHCI_BUFFER            0x20
+#define SDHCI_PRESENT_STATE     0x24
+#define SDHCI_HOST_CONTROL      0x28
+#define SDHCI_CLOCK_CONTROL     0x2c
+#define SDHCI_CLOCK_INT_EN      0x0001
+#define SDHCI_CLOCK_INT_STABLE  0x0002
+#define SDHCI_CLOCK_CARD_EN     0x0004
+/*
+ * The SDHCI divider field (CLOCK_CONTROL 15:8, plus 7:6 for SDHCI 3.0)
+ * is ignored by this MSM v4 core; the card rate is the GCC
+ * sdcc1_apps_clk_src rate, so the field stays 0 (see
+ * sdhci_gcc_set_apps()).
+ */
+#define SDHCI_POWER_CONTROL     0x29
+#define SDHCI_SOFTWARE_RESET    0x2f
+#define SDHCI_INT_STATUS        0x30
+#define SDHCI_INT_ENABLE        0x34
+#define SDHCI_SIGNAL_ENABLE     0x38
 
-/* shim/emmc.c-validated offsets within the core window. */
-#define REG_PRESENT	0x24
-#define REG_HOSTCTL	0x28
-#define REG_PWRCTL	0x2c
-#define REG_BLKSZ	0x30
-#define REG_TRANS	0x38
-#define REG_CMD		0x3c
-#define REG_CAPA0	0xfc
-#define REG_CAPA1	0x100
+#define SDHCI_MAKE_BLKSZ(dma, blksz) (((dma) << 12) | ((blksz) & 0xfff))
 
-static volatile uint32_t *g_core;	/* mapped VA of the core window */
+#define SDHCI_TRNS_BLK_CNT_EN   0x0002
+#define SDHCI_TRNS_AUTO_CMD12   0x0004
+#define SDHCI_TRNS_READ         0x0010
+#define SDHCI_TRNS_MULTI        0x0020
+
+#define SDHCI_CMD_RESP_LONG     0x01
+#define SDHCI_CMD_RESP_SHORT    0x02
+#define SDHCI_CMD_RESP_SHORT_BUSY 0x03
+#define SDHCI_CMD_CRC            0x08
+#define SDHCI_CMD_INDEX          0x10
+#define SDHCI_CMD_DATA           0x20
+#define SDHCI_MAKE_CMD(c, f)     ((((c) & 0xff) << 8) | ((f) & 0xff))
+
+#define SDHCI_CMD_INHIBIT       0x00000001u
+#define SDHCI_DATA_INHIBIT      0x00000002u
+/* PRESENT_STATE[20]: DAT0 line level, used for R1b/CMD6 busy polling. */
+#define SDHCI_DATA_0_LVL_MASK   0x00100000u
+
+#define SDHCI_CTRL_DMA_MASK     0x18u
+#define SDHCI_CTRL_4BITBUS      0x02u
+#define SDHCI_CTRL_8BITBUS      0x20u
+#define SDHCI_CTRL_HISPD        0x04u
+#define SDHCI_CTRL_BUS_MASK     (SDHCI_CTRL_4BITBUS | SDHCI_CTRL_8BITBUS)
+/*
+ * HOST_CONTROL2[2:0] is the UHS mode select. sdhci_msm_set_uhs_signaling()
+ * clears it for HS200/HS400/SDR104 when the card clock is <= 100 MHz: modes
+ * >= 3 expect the DLL/tuned receive path and do not select the fixed feedback
+ * clock, so CMD responses cannot be sampled. Preserve VDD_180 (bit 3) while
+ * clearing the mode.
+ */
+#define SDHCI_CTRL_UHS_MASK     0x0007u
+
+#define SDHCI_RESET_ALL         0x01
+#define SDHCI_RESET_CMD         0x02
+#define SDHCI_RESET_DATA        0x04
+
+#define SDHCI_INT_CC            0x00000001u
+#define SDHCI_INT_TC            0x00000002u
+#define SDHCI_INT_BWR           0x00000010u
+#define SDHCI_INT_BRR           0x00000020u
+#define SDHCI_INT_ERR           0x00008000u
+/*
+ * The specific error bits behind SDHCI_INT_ERR (SDHCI 3.0, one dword at
+ * 0x30). They separate "the card never answered" (CMD_TIMEOUT) from "the
+ * controller never shifted the command at all" (nothing but the software
+ * deadline), which is exactly the ambiguity a bare timeout leaves.
+ */
+#define SDHCI_INT_CMD_TIMEOUT   0x00010000u     /* no response from the card */
+#define SDHCI_INT_CMD_CRC       0x00020000u
+#define SDHCI_INT_CMD_END_BIT   0x00040000u
+#define SDHCI_INT_CMD_INDEX     0x00080000u
+
+/* ------------------------------------------ Qualcomm MSM v4 core registers */
+#define SDHCI_HC_OFFSET         0x900           /* HC base - core base */
+#define SDHCI_HOST_VERSION      0xfe
+#define CORE_MCI_VERSION        0x50            /* read-only core ID */
+#define CORE_GENERICS           0x70
+#define CORE_HC_MODE            0x78
+#define CORE_HC_MODE_EN         0x00000001u
+#define CORE_FF_CLK_SW_RST_DIS  0x00002000u
+#define CORE_PWRCTL_STATUS      0xdc
+#define CORE_PWRCTL_MASK        0xe0
+#define CORE_PWRCTL_CLEAR       0xe4
+#define CORE_PWRCTL_CTL         0xe8
+#define CORE_PWRCTL_BUS_OFF     0x00000001u
+#define CORE_PWRCTL_BUS_ON      0x00000002u
+#define CORE_PWRCTL_IO_LOW      0x00000004u
+#define CORE_PWRCTL_IO_HIGH     0x00000008u
+#define CORE_PWRCTL_INT_MASK    0x0000000fu
+#define CORE_PWRCTL_BUS_SUCCESS 0x00000001u
+#define CORE_PWRCTL_IO_SUCCESS  0x00000004u
+#define CORE_IO_PAD_PWR_SWITCH_EN 0x00008000u    /* BIT(15) */
+#define CORE_IO_PAD_PWR_SWITCH    0x00010000u    /* BIT(16) */
+
+#define SDHCI_TIMEOUT_CONTROL   0x2e
+#define SDHCI_TIMEOUT_MAX       0x0eu
+#define SDHCI_HOST_CONTROL2     0x3e
+#define SDHCI_CTRL_VDD_180      0x0008u
+#define SDHCI_POWER_ON          0x01u
+#define SDHCI_POWER_180         0x0au
+#define SDHCI_POWER_CONTROL_VAL (SDHCI_POWER_180 | SDHCI_POWER_ON) /* 0x0b */
+
+#define PWRCTL_TIMEOUT_NS       (100ull * NSEC_PER_MSEC)
+#define RESET_TIMEOUT_NS        (100ull * NSEC_PER_MSEC)
+#define CLOCK_STABLE_TIMEOUT_NS (150ull * NSEC_PER_MSEC)
+/*
+ * Qualcomm vendor-specific registers CORE_DLL_CONFIG (0x100), CORE_DLL_STATUS
+ * (0x108), CORE_VENDOR_SPEC (0x10c), CORE_VENDOR_SPEC_FUNC2 (0x110), and
+ * CORE_VENDOR_SPEC_CAPABILITIES0 (0x11c) reside at offsets within hc_mem
+ * (0x07824900), mapping physically to 0x07824a00..0x07824a1c (HC + 0x100..0x11c),
+ * while core_mem (0x07824000) hosts only legacy MCI registers (MCI_VERSION 0x50,
+ * GENERICS 0x70, HC_MODE 0x78, PWRCTL 0xdc..0xe8).
+ * HC + 0x10c: vendor clock/DLL control (physically 0x07824a0c). Linux resets
+ * it to CORE_VENDOR_SPEC_POR_VAL before HC mode; bits 9:8 select HC datapath.
+ * POR value is MCLK sel 2 (0xa9c); LK's board value adds the 1.8V pad power
+ * switch (0x18000), which no reset value carries.
+ */
+#define CORE_VENDOR_SPEC        0x10c
+#define CORE_VENDOR_SPEC_POR_VAL 0x00000a9cu
+#define CORE_VENDOR_SPEC_BOARD_VAL (CORE_VENDOR_SPEC_POR_VAL | \
+	CORE_IO_PAD_PWR_SWITCH_EN | CORE_IO_PAD_PWR_SWITCH)
+#define CORE_VENDOR_SPEC_HS400_DIV2_VAL (CORE_VENDOR_SPEC_BOARD_VAL | (1u << 8))
+#define CORE_HC_MCLK_SEL_MASK   (3u << 8)
+#define CORE_HC_MCLK_SEL_DFLT   (2u << 8)
+#define CORE_HC_SELECT_IN_EN    0x00040000u     /* BIT(18) */
+#define CORE_HC_SELECT_IN_MASK  (7u << 19)
+/*
+ * HC + 0x100: DLL configuration (physically 0x07824a00; sdhci-msm.c).
+ * CORE_CK_OUT_EN hands the card clock to DLL output; CORE_DLL_EN arms DLL.
+ * Selecting a DLL that is not running drives no card clock; output source
+ * must follow DLL state: bypass if DLL is in reset/off, DLL output if locked.
+ */
+#define CORE_DLL_CONFIG         0x100
+#define CORE_DLL_STATUS         0x108
+#define CORE_DLL_LOCK           0x00000080u     /* BIT(7) */
+#define CORE_DLL_EN             0x00010000u     /* BIT(16) */
+#define CORE_CK_OUT_EN          0x00040000u     /* BIT(18) */
+#define CORE_DLL_PDN            0x20000000u     /* BIT(29) */
+#define CORE_DLL_RST            0x40000000u     /* BIT(30) */
+#define CORE_DLL_OFF            (CORE_DLL_RST | CORE_DLL_PDN)
+/* Legacy MCI window the bootloader drove (LK mmc.c MMC_BOOT_MCI_POWER/CLK). */
+#define CORE_MCI_POWER          0x000
+#define CORE_MCI_CLK            0x004
+
+/* ---------------------------------------------------- GCC SDCC1 apps clock */
+/*
+ * sdcc1_apps_clk_src is a Qualcomm RCG in the GCC block (DT gcc@1800000,
+ * reg 0x01800000+0x80000; msm8937.dtsi). Only the 4 KiB page holding this
+ * RCG is mapped: CMD_RCGR 0x01842004 -> 0x004, CFG_RCGR 0x008, M 0x00c,
+ * N 0x010, D 0x014, CBCR 0x018.
+ *
+ * The apps branch (CBCR bit 0, halt bit 31) and the AHB branch at 0x4201c
+ * were left enabled by LK; only the RCG rate is written. Register layout:
+ *   CMD_RCGR: bit0 UPDATE, bit1 ROOT_EN, bits4-7 DIRTY, bit31 ROOT_OFF
+ *   CFG_RCGR: [4:0] SRC_DIV, [10:8] SRC_SEL, [13:12] MODE
+ *   parents:  XO=0 (19.2 MHz), GPLL0=1 (800 MHz), GPLL4=2 (1152 MHz)
+ */
+#define GCC_SDCC1_APPS_PHYS      0x01842000u
+#define GCC_SDCC1_APPS_SIZE      0x1000u
+#define GCC_SDCC1_APPS_CMD_RCGR  0x004u
+#define GCC_SDCC1_APPS_CFG_RCGR  0x008u
+#define GCC_SDCC1_APPS_M         0x00cu
+#define GCC_SDCC1_APPS_N         0x010u
+#define GCC_SDCC1_APPS_D         0x014u
+#define GCC_SDCC1_APPS_CBCR      0x018u
+
+#define MIDO_GCC_SDCC1_BCR       0x000u   /* SDCC1 block reset (GCC page base + 0) */
+#define MIDO_GCC_SDCC1_AHB_CBCR  0x01cu   /* AHB branch: controller register bus clock */
+
+#define GCC_CMD_UPDATE           0x00000001u
+#define GCC_CMD_ROOT_OFF         0x80000000u
+#define GCC_CFG_DIV_MASK         0x0000001fu
+#define GCC_CFG_SEL_MASK         0x00000700u
+#define GCC_CFG_MODE_MASK        0x00003000u
+#define GCC_CBCR_CLK_OFF         0x80000000u
+
+/*
+ * RCG divider programs, exactly as clk_rcg2_set_rate() encodes them. The
+ * M/N/D registers hold inverted values and SRC_DIV is (2*h - 1):
+ *   400 kHz: XO 19.2 MHz, h=12 -> pre_div 23, m=1, n=4, dual edge
+ *            M=1, N=~(4-1)=0xfc, D=~clamp(4,1,6)=0xfb, CFG=0x2017
+ *   25 MHz:  GPLL0 800 MHz, h=16 -> pre_div 31, m=1, n=2, dual edge
+ *            M=1, N=~(2-1)=0xfe, D=~clamp(2,1,2)=0xfd, CFG=0x211f
+ */
+struct mido_gcc_rate {
+	const char *name;
+	uint32_t m, n, d;
+	uint32_t cfg;           /* SRC_DIV | SRC_SEL << 8 | MODE << 12 */
+};
+
+static const struct mido_gcc_rate mido_gcc_rates[] = {
+	{ "400 kHz", 0x01u, 0xfcu, 0xfbu, 0x2017u },
+	{ "25 MHz",  0x01u, 0xfeu, 0xfdu, 0x211fu },
+};
+#define MIDO_GCC_RATE_400K   0
+#define MIDO_GCC_RATE_25M    1
+
+/*
+ * The relative card address the bootloader assigned in CMD3. Qualcomm LK/ABL
+ * use MMC_RCA 2 (bootloader_lk include/mmc.h), but it is probed, never
+ * assumed: CMD13/CMD9/CMD10 are addressed commands and must carry the RCA in
+ * bits 31:16, unlike CMD8 (SEND_EXT_CSD), whose argument is all stuff bits.
+ */
+#define MIDO_CARD_RCA        2u
+
+/* eMMC R1 status word (JESD84-B51): [12:9] state, bit8 ready, bit7 switch. */
+#define SDHCI_R1_STATE_MASK      0x00001e00u
+#define SDHCI_R1_STATE_TRAN      4u
+#define SDHCI_R1_READY_FOR_DATA  0x00000100u
+#define SDHCI_R1_SWITCH_ERROR    0x00000080u
+
+/* CMD6 SWITCH fields (JESD84-B51): write-byte, EXT_CSD index, value, set. */
+#define EXT_CSD_CMD_SET_NORMAL  0u
+#define EXT_CSD_WRITE_BYTE      3u
+#define EXT_CSD_BUS_WIDTH       183u
+#define EXT_CSD_BUS_WIDTH_4     1u
+#define EXT_CSD_BUS_WIDTH_8     2u
+#define EXT_CSD_HS_TIMING       185u
+#define EXT_CSD_TIMING_HS       1u
+
+/* --------------------------------------------------------------- transfers */
+#define SDHCI_BLOCK             512u
+#define BOUNCE_SIZE             (1u << 20)
+/*
+ * SYSTEM partition log area used by the persistent console log
+ * (bsd/dev/mido_sdhci.c + xnu/patches/0143): sector 0 carries the
+ * mido_log_header, sectors 1..8192 the 4 MiB circular ring.
+ */
+#define MIDO_LOG_SYSTEM_BLOCKS 8193u
+#define DMA_BOUNCE              0x0000
+#define CMD_TIMEOUT_NS          (100ull * NSEC_PER_MSEC)
+#define DATA_TIMEOUT_NS         (2ull * NSEC_PER_SEC)
+#define CMD6_BUSY_TIMEOUT_NS    (1ull * NSEC_PER_SEC)
+
+static struct {
+	vm_offset_t regs;                       /* core base, HC at +0x900 */
+	vm_offset_t gcc;                        /* GCC sdcc1_apps RCG page */
+	vm_offset_t dma;                        /* kernel VA of the bounce buffer */
+	uint64_t dma_pa;
+	uint64_t last_cmd_ns;                   /* duration of the last command */
+	char part[64];                          /* GPT partition name */
+	uint64_t first_block, nblocks;          /* root partition, 512-byte sectors */
+	uint64_t sys_first_block, sys_nblocks;  /* "system" partition, 512-byte sectors */
+	uint32_t sec_count;                     /* EXT_CSD SEC_COUNT, 512-byte units */
+	uint32_t rca;                           /* RCA the card answered with */
+	uint32_t secsize;                       /* logical sector size for BSD */
+	uint8_t saved_ctrl;                     /* HOST_CONTROL at hand-off */
+	uint16_t saved_hc2;                     /* HOST_CONTROL2 at hand-off */
+	uint8_t saved_timeout;                  /* TIMEOUT_CONTROL at hand-off */
+	bool enumerated;                        /* card is 25 MHz, 8-bit, HS */
+	bool log_ok;                            /* SYSTEM log area is safe */
+	bool writable;                          /* boot-arg emmcrw=1 */
+	int bmajor, cmajor;
+	dev_t bdev;
+	bool ready;
+} se;
+
+static LCK_GRP_DECLARE(mido_sdhci_grp, "mido_sdhci");
+static LCK_MTX_DECLARE(mido_sdhci_lock, &mido_sdhci_grp);
 
 static inline uint32_t
-rd32(uint32_t off)
+hc_rd(uint32_t off)
 {
-	return *(volatile uint32_t *)(g_core + off / sizeof(uint32_t));
+	return *(volatile uint32_t *)(se.regs + SDHCI_HC_OFFSET + off);
+}
+
+static inline void
+hc_wr(uint32_t off, uint32_t val)
+{
+	*(volatile uint32_t *)(se.regs + SDHCI_HC_OFFSET + off) = val;
+}
+
+static inline uint16_t
+hc_rd16(uint32_t off)
+{
+	return *(volatile uint16_t *)(se.regs + SDHCI_HC_OFFSET + off);
+}
+
+static inline void
+hc_wr16(uint32_t off, uint16_t val)
+{
+	*(volatile uint16_t *)(se.regs + SDHCI_HC_OFFSET + off) = val;
+}
+
+static inline uint8_t
+hc_rd8(uint32_t off)
+{
+	return *(volatile uint8_t *)(se.regs + SDHCI_HC_OFFSET + off);
+}
+
+static inline void
+hc_wr8(uint32_t off, uint8_t val)
+{
+	*(volatile uint8_t *)(se.regs + SDHCI_HC_OFFSET + off) = val;
+}
+
+static inline uint32_t
+core_rd(uint32_t off)
+{
+	return *(volatile uint32_t *)(se.regs + off);
+}
+
+static inline void
+core_wr(uint32_t off, uint32_t val)
+{
+	*(volatile uint32_t *)(se.regs + off) = val;
+}
+
+/*
+ * GCC registers are mapped read/write, uncached and outside the SDHCI reset
+ * domain. They are not touched until sdhci_gcc_set_apps() validates the
+ * branch/root state.
+ */
+static inline uint32_t
+gcc_rd(uint32_t off)
+{
+	return *(volatile uint32_t *)(se.gcc + off);
+}
+
+static inline void
+gcc_wr(uint32_t off, uint32_t val)
+{
+	*(volatile uint32_t *)(se.gcc + off) = val;
+}
+
+/* PIO is CPU-driven, but the bounce buffer is shared with every later user of
+ * this driver; keep it clean/invalidated like the UFS driver does for DMA. */
+static void
+dma_sync(uint32_t len, bool is_read)
+{
+	flush_dcache64((addr64_t)(se.dma_pa + DMA_BOUNCE), len, is_read);
 }
 
 static int
-mido_sdhci_map(void)
+sdhci_poll_state(uint32_t mask, uint64_t timeout_ns)
 {
-	DTEntry node;
-	uintptr_t const *reg = NULL;
-	unsigned int size = 0;
-	uint64_t base = MIDO_SDCC1_CORE;
-	uint64_t winsz = MIDO_SDCC1_CORE_SIZE;
+	uint64_t deadline;
 
-	if (SecureDTLookupEntry(NULL, "/mido-sdhci", &node) == kSuccess &&
-	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) == kSuccess &&
-	    size >= 2 * sizeof(uintptr_t)) {
-		base = reg[0];
-		winsz = reg[1];
+	nanoseconds_to_absolutetime(timeout_ns, &deadline);
+	deadline += mach_absolute_time();
+	while (hc_rd(SDHCI_PRESENT_STATE) & mask) {
+		if (mach_absolute_time() > deadline) {
+			return ETIMEDOUT;
+		}
+		delay(1);
 	}
-	vm_offset_t va = ml_io_map((vm_offset_t)base, (vm_size_t)winsz);
-	if (!va) {
-		printf("MIDO SDHCI: ml_io_map(0x%llx, 0x%llx) failed\n",
-		    (unsigned long long)base, (unsigned long long)winsz);
-		return ENOMEM;
-	}
-	g_core = (volatile uint32_t *)va;
-	printf("MIDO SDHCI: core window mapped va=%p phys=0x%llx\n",
-	    g_core, (unsigned long long)base);
 	return 0;
 }
 
 /*
- * Dump the SDHCI host state. Read-only: no command is issued, so this cannot
- * disturb the controller the bootloader is still using.
+ * Record how long the command frame took. Probe step 2 uses it to prove the
+ * GCC RCG write reached the card: CMD0 takes ~0.5 us at the inherited
+ * 384 MHz and ~130 us at 400 kHz, independent of whether the card answers.
  */
-void
-mido_sdhci_diag(void)
+static void
+sdhci_cmd_stamp(uint64_t start)
 {
-	if (!g_core && mido_sdhci_map() != 0) {
-		return;
-	}
-	uint32_t prs   = rd32(REG_PRESENT);
-	uint32_t hc    = rd32(REG_HOSTCTL);
-	uint32_t pwr   = rd32(REG_PWRCTL);
-	uint32_t blksz = rd32(REG_BLKSZ);
-	uint32_t trans = rd32(REG_TRANS);
-	uint32_t capa0 = rd32(REG_CAPA0);
-	uint32_t capa1 = rd32(REG_CAPA1);
+	uint64_t ns = 0;
 
-	printf("MIDO SDHCI DIAG:\n");
-	printf("  PRESENT  0x%08x\n", prs);
-	printf("    card_inserted=%u cmd_inhibit=%u dat_inhibit=%u\n",
-	    (prs >> 16) & 1u, prs & 1u, (prs >> 1) & 1u);
-	printf("    clk_stable=%u buf_wr=%u buf_rd=%u\n",
-	    (prs >> 3) & 1u, (prs >> 10) & 1u, (prs >> 11) & 1u);
-	printf("  HOSTCTL  0x%08x  PWRCTL 0x%08x\n", hc, pwr);
-	printf("  BLKSZ    0x%08x  TRANS  0x%08x\n", blksz, trans);
-	printf("  CAPA0    0x%08x  CAPA1  0x%08x\n", capa0, capa1);
-	printf("    spec_ver=0x%x baseclk=%uMHz adma2=%u v3_64=%u\n",
-	    capa0 & 0xffu, (capa0 >> 8) & 0xffu, (capa0 >> 19) & 1u,
-	    (capa0 >> 27) & 1u);
-	printf("    max_block_len_log2=0x%x\n", (capa0 >> 16) & 0x3u);
+	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+	se.last_cmd_ns = ns;
 }
 
 /*
- * IOFindBSDRoot hook target for rd=emmcroot0. Diagnostic only: report the
- * target GPT partition (emmcroot= boot-arg, default "userdata"), dump the
- * host, and refuse to mount (ENXIO) so the boot prints the host state but
- * stalls. The next milestone returns 0 here and fills *dev.
+ * Issue one command and wait for Command Complete.
+ *
+ * The status register is cleared before the command is written: the
+ * bootloader leaves Command Complete (and possibly an error) set, and a stale
+ * bit would otherwise be read as this command's result. Every failure prints
+ * the argument, the raw status (with the specific error bits named) and
+ * PRESENT_STATE, because "no response", "CRC error" and "the command never
+ * shifted" are one indistinguishable timeout without them.
  */
-int
-mido_emmc_rootdev(dev_t *dev)
+static int
+sdhci_cmd(uint8_t index, uint32_t arg, uint16_t tr_mode, uint16_t flags,
+    uint32_t *resp)
 {
-	char want[64] = "userdata";
+	uint64_t deadline, start;
+	int error;
 
-	(void)dev;
-	PE_parse_boot_argn("emmcroot", want, sizeof(want));
-	printf("MIDO SDHCI: emmcroot boot-arg = \"%s\" (target GPT partition)\n", want);
-	mido_sdhci_diag();
-	printf("MIDO SDHCI: diagnostic only; root-on-eMMC not yet implemented\n");
+	se.last_cmd_ns = 0;
+	error = sdhci_poll_state(SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT,
+	    CMD_TIMEOUT_NS);
+	if (error) {
+		printf("MIDO SDHCI: command %u blocked (arg 0x%08x, "
+		    "INT_STATUS 0x%08x, PRESENT_STATE 0x%08x)\n", index, arg,
+		    hc_rd(SDHCI_INT_STATUS), hc_rd(SDHCI_PRESENT_STATE));
+		return EBUSY;
+	}
+
+	hc_wr(SDHCI_INT_STATUS, hc_rd(SDHCI_INT_STATUS));
+	hc_wr(SDHCI_ARGUMENT, arg);
+	hc_wr16(SDHCI_TRANSFER_MODE, tr_mode);
+	start = mach_absolute_time();
+	hc_wr16(SDHCI_COMMAND, (uint16_t)SDHCI_MAKE_CMD(index, flags));
+
+	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+	deadline += mach_absolute_time();
+	for (;;) {
+		uint32_t st = hc_rd(SDHCI_INT_STATUS);
+
+		if (st & SDHCI_INT_ERR) {
+			sdhci_cmd_stamp(start);
+			hc_wr(SDHCI_INT_STATUS, st);
+			printf("MIDO SDHCI: command %u failed (arg 0x%08x, "
+			    "INT_STATUS 0x%08x%s%s%s%s, PRESENT_STATE "
+			    "0x%08x, %llu ns)\n", index, arg, st,
+			    (st & SDHCI_INT_CMD_TIMEOUT) ? " cmd-timeout" : "",
+			    (st & SDHCI_INT_CMD_CRC) ? " cmd-crc" : "",
+			    (st & SDHCI_INT_CMD_END_BIT) ? " cmd-end-bit" : "",
+			    (st & SDHCI_INT_CMD_INDEX) ? " cmd-index" : "",
+			    hc_rd(SDHCI_PRESENT_STATE),
+			    (unsigned long long)se.last_cmd_ns);
+			return EIO;
+		}
+		if (st & SDHCI_INT_CC) {
+			sdhci_cmd_stamp(start);
+			hc_wr(SDHCI_INT_STATUS, SDHCI_INT_CC);
+			if (resp) {
+				*resp = hc_rd(SDHCI_RESPONSE);
+			}
+			return 0;
+		}
+		if (mach_absolute_time() > deadline) {
+			sdhci_cmd_stamp(start);
+			printf("MIDO SDHCI: command %u timed out (arg "
+			    "0x%08x, INT_STATUS 0x%08x, PRESENT_STATE 0x%08x, "
+			    "CMD_INHIBIT %u, %llu ns)\n", index, arg, st,
+			    hc_rd(SDHCI_PRESENT_STATE),
+			    hc_rd(SDHCI_PRESENT_STATE) & SDHCI_CMD_INHIBIT,
+			    (unsigned long long)se.last_cmd_ns);
+			return ETIMEDOUT;
+		}
+		delay(1);
+	}
+}
+
+/* Wait for one data interrupt (BRR for reads, BWR for writes); clear it. */
+static int
+sdhci_wait_data(uint32_t bit)
+{
+	uint64_t deadline;
+
+	nanoseconds_to_absolutetime(DATA_TIMEOUT_NS, &deadline);
+	deadline += mach_absolute_time();
+	for (;;) {
+		uint32_t st = hc_rd(SDHCI_INT_STATUS);
+
+		if (st & SDHCI_INT_ERR) {
+			hc_wr(SDHCI_INT_STATUS, st);
+			return EIO;
+		}
+		if (st & bit) {
+			hc_wr(SDHCI_INT_STATUS, bit);
+			return 0;
+		}
+		if (mach_absolute_time() > deadline) {
+			return ETIMEDOUT;
+		}
+		delay(1);
+	}
+}
+
+static int
+sdhci_wait_transfer_complete(void)
+{
+	uint64_t deadline;
+
+	nanoseconds_to_absolutetime(DATA_TIMEOUT_NS, &deadline);
+	deadline += mach_absolute_time();
+	for (;;) {
+		uint32_t st = hc_rd(SDHCI_INT_STATUS);
+
+		if (st & SDHCI_INT_ERR) {
+			hc_wr(SDHCI_INT_STATUS, st);
+			return EIO;
+		}
+		if (st & SDHCI_INT_TC) {
+			hc_wr(SDHCI_INT_STATUS, SDHCI_INT_TC);
+			return 0;
+		}
+		if (mach_absolute_time() > deadline) {
+			return ETIMEDOUT;
+		}
+		delay(1);
+	}
+}
+
+static int
+sdhci_stop_transmission(void)
+{
+	return sdhci_cmd(12, 0, 0,
+	    SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, NULL);
+}
+
+/* Reset the command and data paths and wait for the core to self-clear. */
+static int
+sdhci_reset_paths(void)
+{
+	uint64_t deadline;
+
+	hc_wr8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+	deadline += mach_absolute_time();
+	while (hc_rd8(SDHCI_SOFTWARE_RESET) &
+	    (SDHCI_RESET_CMD | SDHCI_RESET_DATA)) {
+		if (mach_absolute_time() > deadline) {
+			printf("MIDO SDHCI: path reset did not complete "
+			    "(SOFTWARE_RESET 0x%02x)\n",
+			    hc_rd8(SDHCI_SOFTWARE_RESET));
+			return ETIMEDOUT;
+		}
+		delay(1);
+	}
+	hc_wr(SDHCI_INT_STATUS, hc_rd(SDHCI_INT_STATUS));
+	return 0;
+}
+
+/*
+ * Recover the controller after a failed command or data transfer: reset the
+ * command and data paths, drop every pending interrupt, then try a best-effort
+ * CMD12 so the card leaves its data state. The CMD12 can itself time out (the
+ * card is exactly what is not answering), so its status is ignored - but the
+ * paths are reset a second time afterwards, because a timed-out CMD12 leaves
+ * CMD_INHIBIT set on this core and every later command would fail with EBUSY.
+ */
+static void
+sdhci_recover(void)
+{
+	(void)sdhci_reset_paths();
+	(void)sdhci_stop_transmission();
+	(void)sdhci_reset_paths();
+}
+
+/*
+ * Polled PIO read of count 512-byte blocks. index is 18 (multi-block) or
+ * 8/17 (single block). Data is assembled from the FIFO port, 128 words per
+ * block.
+ *
+ * For single-block reads (count == 1), CMD17 is used without AUTO_CMD12 or
+ * BLK_CNT_EN; the card returns to TRAN automatically after 1 block.
+ * For multi-block reads (count > 1), CMD18 is used with AUTO_CMD12 so the
+ * host controller automatically terminates the streaming data transfer.
+ */
+static int
+sdhci_read_pio(uint8_t index, uint32_t arg, uint32_t count, void *buf)
+{
+	uint16_t tr_mode;
+	uint32_t *dst = (uint32_t *)buf;
+	int error;
+
+	if (count == 0 || count > BOUNCE_SIZE / SDHCI_BLOCK) {
+		return EINVAL;
+	}
+
+	if (index == 18 && count == 1) {
+		index = 17;
+	} else if (index == 17 && count > 1) {
+		index = 18;
+	}
+
+	hc_wr16(SDHCI_BLOCK_SIZE, SDHCI_MAKE_BLKSZ(0, SDHCI_BLOCK));
+	hc_wr16(SDHCI_BLOCK_COUNT, (uint16_t)count);
+
+	if (index == 18) {
+		tr_mode = SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN |
+		    SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD12;
+	} else {
+		tr_mode = SDHCI_TRNS_READ;
+	}
+	error = sdhci_cmd(index, arg, tr_mode,
+	    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX |
+	    SDHCI_CMD_DATA, NULL);
+	if (error) {
+		sdhci_recover();
+		return error;
+	}
+
+	for (uint32_t b = 0; b < count; b++) {
+		error = sdhci_wait_data(SDHCI_INT_BRR);
+		if (error) {
+			sdhci_recover();
+			return error;
+		}
+		for (uint32_t i = 0; i < SDHCI_BLOCK / 4; i++) {
+			dst[b * (SDHCI_BLOCK / 4) + i] = hc_rd(SDHCI_BUFFER);
+		}
+	}
+	error = sdhci_wait_transfer_complete();
+	if (error) {
+		sdhci_recover();
+		return error;
+	}
+	return 0;
+}
+
+/*
+ * Polled PIO write of count 512-byte blocks. For count == 1, CMD24 is used.
+ * For count > 1, CMD25 is used with AUTO_CMD12.
+ */
+static int
+sdhci_write_pio(uint32_t lba, uint32_t count, const void *buf)
+{
+	const uint32_t *src = (const uint32_t *)buf;
+	uint16_t tr_mode;
+	uint8_t index = (count == 1) ? 24 : 25;
+	int error;
+
+	if (count == 0 || count > BOUNCE_SIZE / SDHCI_BLOCK) {
+		return EINVAL;
+	}
+	hc_wr16(SDHCI_BLOCK_SIZE, SDHCI_MAKE_BLKSZ(0, SDHCI_BLOCK));
+	hc_wr16(SDHCI_BLOCK_COUNT, (uint16_t)count);
+
+	if (index == 25) {
+		tr_mode = SDHCI_TRNS_MULTI | SDHCI_TRNS_BLK_CNT_EN |
+		    SDHCI_TRNS_AUTO_CMD12;
+	} else {
+		tr_mode = 0;
+	}
+
+	error = sdhci_cmd(index, lba, tr_mode,
+	    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX |
+	    SDHCI_CMD_DATA, NULL);
+	if (error) {
+		sdhci_recover();
+		return error;
+	}
+
+	for (uint32_t b = 0; b < count; b++) {
+		error = sdhci_wait_data(SDHCI_INT_BWR);
+		if (error) {
+			sdhci_recover();
+			return error;
+		}
+		for (uint32_t i = 0; i < SDHCI_BLOCK / 4; i++) {
+			hc_wr(SDHCI_BUFFER, src[b * (SDHCI_BLOCK / 4) + i]);
+		}
+	}
+	error = sdhci_wait_transfer_complete();
+	if (error) {
+		sdhci_recover();
+		return error;
+	}
+	return 0;
+}
+
+/*
+ * CMD2 / CMD9 / CMD10: 136-bit R2 response into out[0] = MSB word.
+ *
+ * CMD2 is broadcast (arg 0); CMD9/CMD10 are addressed, so arg carries the RCA
+ * in bits 31:16 (Linux include/linux/mmc/mmc.h: "ac [31:16] RCA R2"). R2 has
+ * no opcode byte, so SDHCI_CMD_INDEX must not be set: the controller would
+ * compare a nonexistent index and report SDHCI_INT_CMD_INDEX. CRC is part of
+ * Linux's MMC_RSP_R2. The MSM v4 core strips the 8-bit CRC and right-aligns
+ * the remaining 120 bits, so the payload of the first word sits in bits 23:0;
+ * Linux (sdhci_read_rsp_136()) shifts each word left by 8 and folds in the top
+ * byte of the next. Without that shift the CID decodes as MID 0x00, a blank
+ * PNM and a nonsense serial number.
+ */
+static int
+sdhci_read_response128(uint8_t index, uint32_t arg, uint32_t out[4])
+{
+	int error = sdhci_cmd(index, arg, 0,
+	    SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC, NULL);
+	if (error) {
+		sdhci_recover();
+		return error;
+	}
+	for (int i = 0; i < 4; i++) {
+		uint32_t lo = hc_rd(SDHCI_RESPONSE + 4 * (3 - i));
+		uint32_t hi = (i == 3) ? 0u :
+		    hc_rd(SDHCI_RESPONSE + 4 * (2 - i));
+
+		out[i] = (lo << 8) | (hi >> 24);
+	}
+	return 0;
+}
+
+/*
+ * The vendor core answers only while its GCC clock branch is on.
+ * CORE_MCI_VERSION is a read-only ID register that reads 0x100000xx on a live
+ * SDCC v4 core; 0 or all-ones means the block is unclocked (or the access
+ * never reached it), and then no register in either window can be trusted.
+ */
+static int
+sdhci_core_check(void)
+{
+	uint32_t mci_version = core_rd(CORE_MCI_VERSION);
+	uint32_t generics = core_rd(CORE_GENERICS);
+
+	if (mci_version == 0 || mci_version == 0xffffffffu) {
+		printf("MIDO SDHCI: vendor core does not answer "
+		    "(MCI_VERSION 0x%08x, GENERICS 0x%08x): GCC SDC1 clock "
+		    "branch off or block held in reset\n",
+		    mci_version, generics);
+		return ENXIO;
+	}
+	printf("MIDO SDHCI: core MCI_VERSION 0x%08x GENERICS 0x%08x\n",
+	    mci_version, generics);
+	return 0;
+}
+
+/*
+ * Probe step 0: read-only snapshot. This runs before the driver writes any
+ * register. The legacy MCI window, vendor window and GCC RCG are readable
+ * while LK's HC_MODE is still 0; the standard +0x900 command/clock registers
+ * are not decoded until sdhci_enter_hc_mode(), so they are dumped separately
+ * after the switch and before RESET_ALL.
+ *
+ * Commands cannot be sent here: the card clock gate is still LK's
+ * (CLOCK_CONTROL 0x0003, CARD_EN off), the inherited card rate is 384 MHz and
+ * HOST_CONTROL2 still says UHS=3 with a powered-down DLL. Opening the gate in
+ * that state would only reproduce the b6a8788 timeout at an illegal rate. The
+ * functional CMD13/CMD5 test therefore belongs to step 2, after the GCC clock
+ * and the host receive path are made safe.
+ */
+static void
+sdhci_snapshot_untouched(void)
+{
+	uint32_t vendor = hc_rd(CORE_VENDOR_SPEC);
+	uint32_t dll = hc_rd(CORE_DLL_CONFIG);
+	uint32_t status = hc_rd(CORE_DLL_STATUS);
+
+	printf("MIDO SDHCI: probe step 0: HC_MODE 0x%08x, "
+	    "MCI_POWER 0x%08x, MCI_CLK 0x%08x, VENDOR_SPEC 0x%08x "
+	    "(MCLK sel %u, SELECT_IN 0x%x), DLL_CONFIG 0x%08x "
+	    "DLL_STATUS 0x%08x\n", core_rd(CORE_HC_MODE),
+	    core_rd(CORE_MCI_POWER), core_rd(CORE_MCI_CLK), vendor,
+	    (vendor & CORE_HC_MCLK_SEL_MASK) >> 8,
+	    (vendor & CORE_HC_SELECT_IN_MASK) >> 19, dll, status);
+	printf("MIDO SDHCI: probe step 0: GCC sdcc1_apps CMD 0x%08x "
+	    "CFG 0x%08x M 0x%02x N 0x%02x D 0x%02x CBCR 0x%08x\n",
+	    gcc_rd(GCC_SDCC1_APPS_CMD_RCGR),
+	    gcc_rd(GCC_SDCC1_APPS_CFG_RCGR),
+	    gcc_rd(GCC_SDCC1_APPS_M) & 0xffu,
+	    gcc_rd(GCC_SDCC1_APPS_N) & 0xffu,
+	    gcc_rd(GCC_SDCC1_APPS_D) & 0xffu,
+	    gcc_rd(GCC_SDCC1_APPS_CBCR));
+}
+
+/* The standard window is only valid after HC mode; this is still pre-reset. */
+static void
+sdhci_snapshot_standard(const char *tag)
+{
+	printf("MIDO SDHCI: probe step 0 %s: POWER_CONTROL 0x%02x, "
+	    "CLOCK_CONTROL 0x%04x, HOST_CONTROL 0x%02x, HOST_CONTROL2 0x%04x, "
+	    "TIMEOUT_CONTROL 0x%02x, PRESENT_STATE 0x%08x, INT_STATUS 0x%08x, "
+	    "SOFTWARE_RESET 0x%02x, HOST_VERSION 0x%04x\n", tag,
+	    hc_rd8(SDHCI_POWER_CONTROL), hc_rd16(SDHCI_CLOCK_CONTROL),
+	    hc_rd8(SDHCI_HOST_CONTROL), hc_rd16(SDHCI_HOST_CONTROL2),
+	    hc_rd8(SDHCI_TIMEOUT_CONTROL), hc_rd(SDHCI_PRESENT_STATE),
+	    hc_rd(SDHCI_INT_STATUS), hc_rd8(SDHCI_SOFTWARE_RESET),
+	    hc_rd16(SDHCI_HOST_VERSION));
+}
+
+/*
+ * LK drives SDCC1 through the legacy MCI register set and leaves HC_MODE
+ * (core + 0x78) at 0, so the standard SDHCI window at core + 0x900 is not
+ * decoded yet. Do not trust the bootloader for this: Linux
+ * (sdhci_msm_init(), drivers/mmc/host/sdhci-msm.c) performs the switch itself,
+ * writing HC_MODE_EN and then FF_CLK_SW_RST_DIS.
+ *
+ * CORE_HC_MODE is a plain flop in the core's always-on register block: the
+ * write has landed by the time the bus write is acknowledged, so the read-back
+ * both flushes the posted write and proves the bit. No settling delay is
+ * required before touching the +0x900 window. FF_CLK_SW_RST_DIS is written in
+ * a second access, only after HC_MODE_EN has latched, exactly as Linux does
+ * it: the hardware log from commit df4395e shows HC_MODE 0x00000001 after a
+ * single combined write, i.e. bit 13 was dropped. Bit 13 is what stops the
+ * core from resetting itself whenever the SDCLK feedback is not toggling,
+ * which is the state the controller is in until a card clock is out - so a
+ * dropped bit 13 can hold the command state machine in reset forever.
+ */
+static int
+sdhci_enter_hc_mode(void)
+{
+	uint32_t hc_mode = core_rd(CORE_HC_MODE);
+	uint16_t host_version;
+
+	if ((hc_mode & (CORE_HC_MODE_EN | CORE_FF_CLK_SW_RST_DIS)) ==
+	    (CORE_HC_MODE_EN | CORE_FF_CLK_SW_RST_DIS)) {
+		return 0;
+	}
+
+	printf("MIDO SDHCI: HC_MODE 0x%08x, enabling HC mode\n", hc_mode);
+	/* Step 1: HC_MODE_EN, keeping any other vendor bits LK left. */
+	core_wr(CORE_HC_MODE, (hc_mode & ~CORE_HC_MODE_EN) | CORE_HC_MODE_EN);
+	hc_mode = core_rd(CORE_HC_MODE);
+
+	if (!(hc_mode & CORE_HC_MODE_EN)) {
+		/*
+		 * Some SDCC revisions do not make bit 0 readable. The switch
+		 * happened if the standard window at +0x900 now answers.
+		 */
+		host_version = hc_rd16(SDHCI_HOST_VERSION);
+		if (host_version == 0 || host_version == 0xffffu) {
+			printf("MIDO SDHCI: HC mode did not latch "
+			    "(HC_MODE 0x%08x, HOST_VERSION 0x%04x)\n",
+			    hc_mode, host_version);
+			return ENXIO;
+		}
+		printf("MIDO SDHCI: HC_MODE_EN reads back 0 but the HC "
+		    "window answers (HOST_VERSION 0x%04x)\n", host_version);
+	}
+	/* Step 2: the free-running-clock reset guard, after bit 0 is in. */
+	core_wr(CORE_HC_MODE, hc_mode | CORE_HC_MODE_EN | CORE_FF_CLK_SW_RST_DIS);
+	hc_mode = core_rd(CORE_HC_MODE);
+	if (!(hc_mode & CORE_FF_CLK_SW_RST_DIS)) {
+		printf("MIDO SDHCI: FF_CLK_SW_RST_DIS did not stick "
+		    "(HC_MODE 0x%08x): the core may self-reset while SDCLK "
+		    "feedback is stopped\n", hc_mode);
+	}
+	printf("MIDO SDHCI: HC mode enabled (HC_MODE 0x%08x, "
+	    "HOST_VERSION 0x%04x)\n", hc_mode, hc_rd16(SDHCI_HOST_VERSION));
+	return 0;
+}
+
+/*
+ * HC block clock source. CORE_VENDOR_SPEC[9:8] selects the clock the HC
+ * datapath runs on; LK leaves it at 0 because it only ever drove the legacy
+ * MCI block. With selection 0 the register file still answers (bus clock) and
+ * CLOCK_CONTROL can report INT_EN|INT_STABLE, but a command written to 0x0e
+ * never leaves the shifter: PRESENT_STATE keeps CMD_INHIBIT set and no
+ * completion is ever posted - the exact failure in the df4395e boot log,
+ * including CMD0, which needs no card at all.
+ *
+ * Linux writes CORE_VENDOR_SPEC_POR_VAL in sdhci_msm_probe(), then re-selects
+ * free-running MCLK and disables HC_SELECT_IN from msm_hc_select_default()
+ * before programming any rate. Takeover does the POR write before HC mode and
+ * this selection right after it, so both happen before the first command.
+ */
+static void
+sdhci_select_hc_clock(void)
+{
+	uint32_t vs = hc_rd(CORE_VENDOR_SPEC);
+
+	vs &= ~CORE_HC_MCLK_SEL_MASK;
+	vs |= CORE_HC_MCLK_SEL_DFLT;
+	vs &= ~(CORE_HC_SELECT_IN_EN | CORE_HC_SELECT_IN_MASK);
+	hc_wr(CORE_VENDOR_SPEC, vs);
+	vs = hc_rd(CORE_VENDOR_SPEC);
+	printf("MIDO SDHCI: HC clock source MCLK sel %u (VENDOR_SPEC "
+	    "0x%08x)\n", (vs & CORE_HC_MCLK_SEL_MASK) >> 8, vs);
+}
+
+/*
+ * Card-clock output stage (HC + 0x100). CORE_CK_OUT_EN selects the DLL as
+ * the source of SDCLK; a DLL held in reset, powered down or unlocked cannot
+ * drive it, so the output must fall back to bypass. Linux never sets
+ * CK_OUT_EN outside msm_init_cm_dll() (HS200/HS400 tuning), so bypass is the
+ * correct state for the 400 kHz identification and 52 MHz high-speed path this
+ * driver uses - unless LK left a locked DLL running. Log the register either
+ * way: it is the one clock register the previous boot log never showed.
+ */
+static void
+sdhci_clock_output(void)
+{
+	uint32_t dll = hc_rd(CORE_DLL_CONFIG);
+	uint32_t status = hc_rd(CORE_DLL_STATUS);
+	bool dll_live = (dll & CORE_DLL_EN) && !(dll & CORE_DLL_OFF) &&
+	    (status & CORE_DLL_LOCK);
+	uint32_t want = dll_live ? (dll | CORE_CK_OUT_EN) :
+	    ((dll | CORE_DLL_RST | CORE_DLL_PDN) & ~CORE_CK_OUT_EN);
+
+	printf("MIDO SDHCI: CORE_DLL_CONFIG 0x%08x CORE_DLL_STATUS 0x%08x "
+	    "(DLL_EN %u, PDN %u, RST %u, LOCK %u, CK_OUT_EN %u)\n", dll, status,
+	    (dll & CORE_DLL_EN) ? 1u : 0u, (dll & CORE_DLL_PDN) ? 1u : 0u,
+	    (dll & CORE_DLL_RST) ? 1u : 0u, (status & CORE_DLL_LOCK) ? 1u : 0u,
+	    (dll & CORE_CK_OUT_EN) ? 1u : 0u);
+	if (want != dll) {
+		hc_wr(CORE_DLL_CONFIG, want);
+		printf("MIDO SDHCI: card clock output %s (CORE_DLL_CONFIG "
+		    "0x%08x)\n", dll_live ? "selected from the locked DLL" :
+		    "bypasses the powered-down DLL", hc_rd(CORE_DLL_CONFIG));
+	}
+}
+
+/*
+ * Put the host receive path into the mode sdhci-msm uses below 100 MHz:
+ * HOST_CONTROL2 UHS=0 (fixed feedback clock, no DLL), one data bit, and the
+ * DLL reset/powered down with CK_OUT_EN off. The card clock must already be
+ * gated; callers close CLOCK_CONTROL first.
+ *
+ * This is the b6a8788 fix. That boot proved the GCC RCG reached 400 kHz
+ * (CMD0 took 146.5 us) but CMD1 still timed out: LK had left UHS=3 (SDR104),
+ * so the controller expected the DLL receive path instead of the feedback
+ * clock and never sampled the card's response. VDD_180 is preserved because
+ * this board's I/O supply is fixed at 1.8 V; clearing it would request a 3.3 V
+ * switch that does not exist.
+ */
+static void
+sdhci_set_legacy_host(const char *why)
+{
+	uint16_t hc2 = hc_rd16(SDHCI_HOST_CONTROL2);
+	uint8_t ctrl = hc_rd8(SDHCI_HOST_CONTROL);
+	uint32_t dll = hc_rd(CORE_DLL_CONFIG);
+	uint16_t new_hc2 = (uint16_t)(hc2 & ~SDHCI_CTRL_UHS_MASK);
+	uint8_t new_ctrl = (uint8_t)(ctrl & ~(SDHCI_CTRL_DMA_MASK |
+	    SDHCI_CTRL_HISPD | SDHCI_CTRL_BUS_MASK));
+	uint32_t new_dll = (dll | CORE_DLL_RST | CORE_DLL_PDN) &
+	    ~CORE_CK_OUT_EN;
+
+	printf("MIDO SDHCI: %s: HOST_CONTROL 0x%02x -> 0x%02x, "
+	    "HOST_CONTROL2 0x%04x -> 0x%04x (UHS 0, 1-bit), DLL_CONFIG "
+	    "0x%08x -> 0x%08x (RST|PDN, CK_OUT_EN off)\n", why, ctrl,
+	    new_ctrl, hc2, new_hc2, dll, new_dll);
+	hc_wr16(SDHCI_HOST_CONTROL2, new_hc2);
+	hc_wr8(SDHCI_HOST_CONTROL, new_ctrl);
+	hc_wr(CORE_DLL_CONFIG, new_dll);
+	/* Flush the posted writes before the card clock is re-enabled. */
+	(void)hc_rd16(SDHCI_HOST_CONTROL2);
+	(void)hc_rd8(SDHCI_HOST_CONTROL);
+	(void)hc_rd(CORE_DLL_CONFIG);
+}
+
+/*
+ * Answer pending CORE_PWRCTL requests. No regulator lives in this driver:
+ * LK brought VMMC/VQMMC up and the pad switch is already at 1.8 V, so every
+ * request is answered SUCCESS (Linux sdhci_msm_handle_pwr_irq() does the same
+ * for the voltages the core switches itself). A BUS_ON request re-asserts
+ * LK's pad bits, as Linux's pwr-irq handler does.
+ *
+ * wait == false: the requested state is already current, so no request will
+ * be raised; do not wait 100 ms for one that cannot come.
+ *
+ * Only a request that was raised and cannot be cleared is an error.
+ */
+static int
+sdhci_pwrctl_ack(const char *what, bool wait)
+{
+	uint64_t deadline;
+	uint32_t pending, ack;
+	int retry;
+
+	nanoseconds_to_absolutetime(PWRCTL_TIMEOUT_NS, &deadline);
+	deadline += mach_absolute_time();
+
+	if (wait) {
+		do {
+			pending = core_rd(CORE_PWRCTL_STATUS) &
+			    CORE_PWRCTL_INT_MASK;
+			if (pending) {
+				break;
+			}
+			delay(1);
+		} while (mach_absolute_time() <= deadline);
+	} else {
+		pending = core_rd(CORE_PWRCTL_STATUS) & CORE_PWRCTL_INT_MASK;
+	}
+	if (!pending) {
+		printf("MIDO SDHCI: PWRCTL %s: no request (STATUS 0x%08x), "
+		    "already in that state\n", what,
+		    core_rd(CORE_PWRCTL_STATUS));
+		return 0;
+	}
+
+	for (retry = 0; retry < 10; retry++) {
+		pending = core_rd(CORE_PWRCTL_STATUS) & CORE_PWRCTL_INT_MASK;
+		if (!pending) {
+			printf("MIDO SDHCI: PWRCTL %s acked (CTL 0x%08x)\n",
+			    what, core_rd(CORE_PWRCTL_CTL));
+			return 0;
+		}
+		ack = 0;
+		if (pending & (CORE_PWRCTL_BUS_ON | CORE_PWRCTL_BUS_OFF)) {
+			ack |= CORE_PWRCTL_BUS_SUCCESS;
+		}
+		if (pending & (CORE_PWRCTL_IO_LOW | CORE_PWRCTL_IO_HIGH)) {
+			ack |= CORE_PWRCTL_IO_SUCCESS;
+		}
+		if (pending & CORE_PWRCTL_BUS_ON) {
+			hc_wr(CORE_VENDOR_SPEC, hc_rd(CORE_VENDOR_SPEC) |
+			    CORE_IO_PAD_PWR_SWITCH_EN | CORE_IO_PAD_PWR_SWITCH);
+		}
+		core_wr(CORE_PWRCTL_CLEAR, pending);
+		core_wr(CORE_PWRCTL_CTL, ack);
+		delay(1);
+	}
+	printf("MIDO SDHCI: PWRCTL %s did not clear (STATUS 0x%08x): "
+	    "power handshake failed\n", what, core_rd(CORE_PWRCTL_STATUS));
+	return ETIMEDOUT;
+}
+
+static int
+sdhci_set_bus_power(void)
+{
+	const uint8_t want = SDHCI_POWER_CONTROL_VAL;
+	uint8_t cur = hc_rd8(SDHCI_POWER_CONTROL);
+
+	if (cur == want) {
+		return sdhci_pwrctl_ack("BUS_ON", false);
+	}
+
+	if (cur & SDHCI_POWER_ON) {
+		hc_wr8(SDHCI_POWER_CONTROL, 0);
+		(void)sdhci_pwrctl_ack("BUS_OFF", true);
+	}
+
+	hc_wr8(SDHCI_POWER_CONTROL, want);
+	if (hc_rd8(SDHCI_POWER_CONTROL) != want) {
+		printf("MIDO SDHCI: POWER_CONTROL did not latch 0x%02x "
+		    "(reads 0x%02x)\n", want, hc_rd8(SDHCI_POWER_CONTROL));
+		return ENXIO;
+	}
+	return sdhci_pwrctl_ack("BUS_ON", true);
+}
+
+/*
+ * The MSM SDCC v4 core ignores the SDHCI internal divider. The field-500
+ * boot log timed out CMD1 exactly like divider 0, and probe step 2 now
+ * timestamps CMD0 to measure the real rate. The card clock rate is the GCC
+ * sdcc1_apps_clk rate (sdhci-msm programs it through
+ * msm_set_clock_rate_for_bus_mode()/dev_pm_opp_set_rate()), so the SDHCI
+ * divider field stays 0 and sdhci_gcc_set_apps() programs the RCG.
+ *
+ * LK left CLOCK_CONTROL 0x0003: INT_EN | INT_STABLE, divider 0. That is also
+ * the only divider Linux ever writes on this IP, so 0 is preserved.
+ */
+static int
+sdhci_enable_card_clock(void)
+{
+	uint16_t clk;
+	uint64_t deadline;
+
+	hc_wr16(SDHCI_CLOCK_CONTROL, 0);
+	hc_wr16(SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_EN);
+
+	nanoseconds_to_absolutetime(CLOCK_STABLE_TIMEOUT_NS, &deadline);
+	deadline += mach_absolute_time();
+	for (;;) {
+		clk = hc_rd16(SDHCI_CLOCK_CONTROL);
+		if (clk & SDHCI_CLOCK_INT_STABLE) {
+			break;
+		}
+		if (mach_absolute_time() > deadline) {
+			printf("MIDO SDHCI: SDHCI clock not stable after "
+			    "150 ms (CLOCK_CONTROL 0x%04x): GCC SDC1 branch "
+			    "dead\n", clk);
+			return ETIMEDOUT;
+		}
+		delay(1);
+	}
+
+	/* Read-modify-write: INT_STABLE is a status bit, never written back. */
+	hc_wr16(SDHCI_CLOCK_CONTROL, (uint16_t)(clk | SDHCI_CLOCK_CARD_EN));
+	clk = hc_rd16(SDHCI_CLOCK_CONTROL);
+	printf("MIDO SDHCI: card clock gate was closed, enabled "
+	    "(CLOCK_CONTROL 0x%04x, divider 0: GCC owns the rate)\n", clk);
+	if (!(clk & SDHCI_CLOCK_CARD_EN)) {
+		printf("MIDO SDHCI: card clock gate did not latch "
+		    "(CLOCK_CONTROL 0x%04x)\n", clk);
+		return ENXIO;
+	}
+	return 0;
+}
+
+/*
+ * Program sdcc1_apps_clk_src. This mirrors clk_rcg2_set_rate() on the table
+ * entry in mido_gcc_rates: stage M/N/D, write CFG, set CMD_UPDATE and wait
+ * for the hardware to clear it.
+ *
+ * Ordering and safety:
+ *  - the HC card clock gate is closed first, so the transition cannot reach
+ *    the card mid-frame;
+ *  - the GCC branch (CBCR bit 0, halt bit 31) and the AHB branch at 0x4201c
+ *    are never written; LK left them running and only the RCG rate changes;
+ *  - CFG is read-modify-written so bit 20 (HW clk control) and anything else
+ *    LK set is preserved;
+ *  - the RCG is not touched when its root is parked or the apps branch is
+ *    halted;
+ *  - the card clock is re-enabled at divider 0 afterwards.
+ */
+static int
+sdhci_gcc_set_apps(const struct mido_gcc_rate *r)
+{
+	uint32_t cmd, cfg, cbcr;
+	uint64_t deadline;
+
+	if (se.gcc == 0) {
+		return ENXIO;
+	}
+
+	hc_wr16(SDHCI_CLOCK_CONTROL, 0);
+	delay(1);
+
+	cmd = gcc_rd(GCC_SDCC1_APPS_CMD_RCGR);
+	cfg = gcc_rd(GCC_SDCC1_APPS_CFG_RCGR);
+	cbcr = gcc_rd(GCC_SDCC1_APPS_CBCR);
+	printf("MIDO SDHCI: GCC sdcc1_apps before: CMD 0x%08x CFG 0x%08x "
+	    "M 0x%02x N 0x%02x D 0x%02x CBCR 0x%08x\n", cmd, cfg,
+	    gcc_rd(GCC_SDCC1_APPS_M) & 0xffu, gcc_rd(GCC_SDCC1_APPS_N) & 0xffu,
+	    gcc_rd(GCC_SDCC1_APPS_D) & 0xffu, cbcr);
+
+	if ((cmd & GCC_CMD_ROOT_OFF) || (cbcr & GCC_CBCR_CLK_OFF)) {
+		printf("MIDO SDHCI: GCC sdcc1_apps not running "
+		    "(CMD 0x%08x CBCR 0x%08x), not touching it\n", cmd, cbcr);
+		return ENXIO;
+	}
+
+	gcc_wr(GCC_SDCC1_APPS_M, r->m);
+	gcc_wr(GCC_SDCC1_APPS_N, r->n);
+	gcc_wr(GCC_SDCC1_APPS_D, r->d);
+
+	cfg &= ~(GCC_CFG_DIV_MASK | GCC_CFG_SEL_MASK | GCC_CFG_MODE_MASK);
+	cfg |= r->cfg;
+	gcc_wr(GCC_SDCC1_APPS_CFG_RCGR, cfg);
+	(void)gcc_rd(GCC_SDCC1_APPS_CFG_RCGR);  /* posted before UPDATE */
+
+	gcc_wr(GCC_SDCC1_APPS_CMD_RCGR, cmd | GCC_CMD_UPDATE);
+	nanoseconds_to_absolutetime(500ull * NSEC_PER_USEC, &deadline);
+	deadline += mach_absolute_time();
+	while (gcc_rd(GCC_SDCC1_APPS_CMD_RCGR) & GCC_CMD_UPDATE) {
+		if (mach_absolute_time() > deadline) {
+			printf("MIDO SDHCI: GCC sdcc1_apps update stuck "
+			    "(CMD 0x%08x)\n",
+			    gcc_rd(GCC_SDCC1_APPS_CMD_RCGR));
+			return ETIMEDOUT;
+		}
+		delay(1);
+	}
+
+	printf("MIDO SDHCI: GCC sdcc1_apps now: CMD 0x%08x CFG 0x%08x "
+	    "M 0x%02x N 0x%02x D 0x%02x (%s)\n",
+	    gcc_rd(GCC_SDCC1_APPS_CMD_RCGR),
+	    gcc_rd(GCC_SDCC1_APPS_CFG_RCGR),
+	    gcc_rd(GCC_SDCC1_APPS_M) & 0xffu,
+	    gcc_rd(GCC_SDCC1_APPS_N) & 0xffu,
+	    gcc_rd(GCC_SDCC1_APPS_D) & 0xffu, r->name);
+
+	return sdhci_enable_card_clock();
+}
+
+static int sdhci_send_status(uint32_t rca, uint32_t *r1);
+static int sdhci_sleep_awake(uint32_t rca, uint32_t *r1);
+static int sdhci_enumerate_card(void);
+
+/*
+ * CMD1 SEND_OP_COND. OCR bit31 is the card's power-up status: 1 means ready
+ * (Linux calls the same bit MMC_CARD_BUSY, which reads backwards). Poll only
+ * while the card answers with bit31 clear. A command timeout is not "busy":
+ * no response was sampled, so repeating the same frame cannot help and would
+ * hide the first failure behind 100 identical lines.
+ */
+static int
+sdhci_cmd1_poll(uint32_t *ocr)
+{
+	uint32_t arg = 0x40FF8080u;
+	uint64_t deadline;
+	int error;
+
+	nanoseconds_to_absolutetime(1ull * NSEC_PER_SEC, &deadline);
+	deadline += mach_absolute_time();
+
+	for (int attempt = 0; attempt < 100; attempt++) {
+		*ocr = 0;
+		error = sdhci_cmd(1, arg, 0, SDHCI_CMD_RESP_SHORT, ocr);
+		if (error) {
+			printf("MIDO SDHCI: probe step 2: CMD1 attempt %d "
+			    "got no usable response (%d), OCR 0x%08x, "
+			    "%llu ns; stop\n", attempt + 1, error, *ocr,
+			    (unsigned long long)se.last_cmd_ns);
+			sdhci_recover();
+			return error;
+		}
+		printf("MIDO SDHCI: probe step 2: CMD1 attempt %d OCR "
+		    "0x%08x (%llu ns)\n", attempt + 1, *ocr,
+		    (unsigned long long)se.last_cmd_ns);
+		if (*ocr & 0x80000000u) {
+			printf("MIDO SDHCI: probe step 2: CMD1 ready: OCR "
+			    "bit31 set (card power-up complete)\n");
+			return 0;
+		}
+		/* Linux mmc_send_op_cond(): echo the card's OCR and set the
+		 * sector-mode request bit for the next attempt. */
+		arg = *ocr | 0x40000000u;
+		if (mach_absolute_time() > deadline) {
+			break;
+		}
+		delay(10000);   /* 10 ms between polls, 1 s total */
+	}
+	printf("MIDO SDHCI: probe step 2: CMD1 still busy after 1 s\n");
+	return ETIMEDOUT;
+}
+
+static int
+sdhci_take_over(void)
+{
+	uint16_t handoff_hc2;
+	uint8_t handoff_ctrl, handoff_timeout;
+	uint32_t mci_clk, mci_power, vendor, probe_r1 = 0, probe_ocr = 0;
+	uint64_t deadline;
+	int error, err0, err_cmd1;
+
+	error = sdhci_core_check();
+	if (error) {
+		return error;
+	}
+
+	/* Probe step 0: the only true pre-write snapshot. */
+	sdhci_snapshot_untouched();
+
+	/* Disable power IRQ generation on GIC while polled */
+	core_wr(CORE_PWRCTL_MASK, 0);
+
+	/*
+	 * Sample the legacy MCI window while it is still the active layout:
+	 * LK drove SDCC1 entirely through it, and once HC mode is on these
+	 * flops no longer describe the card clock.
+	 */
+	mci_power = core_rd(CORE_MCI_POWER);
+	mci_clk = core_rd(CORE_MCI_CLK);
+
+	/*
+	 * Step 1: vendor clock and pad supply before HC mode, in Linux's order
+	 * (sdhci_msm_probe: board value with 1.8V pad switches, then HC_MODE_EN,
+	 * then FF_CLK_SW_RST_DIS).
+	 */
+	vendor = hc_rd(CORE_VENDOR_SPEC);
+	printf("MIDO SDHCI: CORE_VENDOR_SPEC 0x%08x (MCLK sel %u, "
+	    "PWRSAVE %u) -> board 0x%08x\n", vendor,
+	    (vendor & CORE_HC_MCLK_SEL_MASK) >> 8, (vendor >> 1) & 1u,
+	    CORE_VENDOR_SPEC_BOARD_VAL);
+	hc_wr(CORE_VENDOR_SPEC, CORE_VENDOR_SPEC_BOARD_VAL);
+
+	/* Step 2: switch the core to SDHCI host controller mode */
+	error = sdhci_enter_hc_mode();
+	if (error) {
+		return error;
+	}
+
+	/* Step 0b: standard window is decoded now, but RESET_ALL is not run. */
+	sdhci_snapshot_standard("(post-HC-mode, pre-reset)");
+
+	/* Drain any stale PWRCTL request firmware or reset left behind */
+	(void)sdhci_pwrctl_ack("stale", false);
+
+	/* Save pre-reset host control, host control 2, timeout control */
+	handoff_ctrl = hc_rd8(SDHCI_HOST_CONTROL);
+	handoff_hc2 = hc_rd16(SDHCI_HOST_CONTROL2);
+	handoff_timeout = hc_rd8(SDHCI_TIMEOUT_CONTROL);
+	if (handoff_timeout == 0) {
+		handoff_timeout = SDHCI_TIMEOUT_MAX;
+	}
+
+	/*
+	 * Step 3: full reset of the HC block (LK sdhci_msm_init and Linux sdhci_init
+	 * do SOFT_RESET_ALL here). GCC clocks are outside the SDHCI reset domain.
+	 */
+	hc_wr8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_ALL);
+	nanoseconds_to_absolutetime(RESET_TIMEOUT_NS, &deadline);
+	deadline += mach_absolute_time();
+	while (hc_rd8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_ALL) {
+		if (mach_absolute_time() > deadline) {
+			printf("MIDO SDHCI: RESET_ALL timed out (0x%02x)\n",
+			    hc_rd8(SDHCI_SOFTWARE_RESET));
+			return ETIMEDOUT;
+		}
+		delay(1);
+	}
+	/* RESET_ALL turns off bus power; acknowledge the BUS_OFF request */
+	(void)sdhci_pwrctl_ack("BUS_OFF", true);
+
+	/* Re-assert vendor clock selection in case core reset affected it */
+	sdhci_select_hc_clock();
+
+	/* Restore host control registers saved before RESET_ALL */
+	hc_wr8(SDHCI_HOST_CONTROL, (uint8_t)(handoff_ctrl & ~SDHCI_CTRL_DMA_MASK));
+	hc_wr16(SDHCI_HOST_CONTROL2, handoff_hc2);
+	hc_wr8(SDHCI_TIMEOUT_CONTROL, handoff_timeout);
+	if (!(handoff_ctrl & SDHCI_CTRL_8BITBUS)) {
+		printf("MIDO SDHCI: host bus width not 8-bit "
+		    "(HOST_CONTROL 0x%02x)\n", handoff_ctrl);
+	}
+
+	/* Step 4: turn on 1.8V bus power and acknowledge BUS_ON request */
+	error = sdhci_set_bus_power();
+	if (error) {
+		printf("MIDO SDHCI: bus power not established (%d)\n", error);
+		return error;
+	}
+
+	/* Step 5: card clock, proved live */
+	error = sdhci_enable_card_clock();
+	if (error) {
+		return error;
+	}
+
+	se.saved_ctrl = handoff_ctrl;
+	se.saved_hc2 = handoff_hc2;
+	se.saved_timeout = handoff_timeout;
+
+	/* Route card clock out (DLL or bypass) */
+	sdhci_clock_output();
+
+	/*
+	 * Polled operation: status enable all ones, signal enable zero.
+	 */
+	hc_wr(SDHCI_INT_ENABLE, 0xffffffffu);
+	hc_wr(SDHCI_SIGNAL_ENABLE, 0);
+	hc_wr(SDHCI_INT_STATUS, hc_rd(SDHCI_INT_STATUS));
+
+	printf("MIDO SDHCI: takeover complete (HC_MODE 0x%08x, "
+	    "VENDOR_SPEC 0x%08x, legacy MCI_CLK 0x%08x, MCI_POWER 0x%08x, "
+	    "POWER_CONTROL 0x%02x, CLOCK_CONTROL 0x%04x, HOST_CONTROL 0x%02x, "
+	    "HOST_CONTROL2 0x%04x, TIMEOUT_CONTROL 0x%02x)\n",
+	    core_rd(CORE_HC_MODE), hc_rd(CORE_VENDOR_SPEC), mci_clk,
+	    mci_power, hc_rd8(SDHCI_POWER_CONTROL),
+	    hc_rd16(SDHCI_CLOCK_CONTROL), hc_rd8(SDHCI_HOST_CONTROL),
+	    hc_rd16(SDHCI_HOST_CONTROL2), hc_rd8(SDHCI_TIMEOUT_CONTROL));
+
+	/*
+	 * Probe step 2: close the card clock, force the host back to the
+	 * low-speed receive path, then program sdcc1_apps_clk_src to 400 kHz.
+	 * The order matters: UHS=3 with the DLL powered down is why b6a8788
+	 * completed CMD0 (no response) but never sampled CMD1's response.
+	 */
+	printf("MIDO SDHCI: probe step 2: gate card clock, UHS=0/1-bit, "
+	    "GCC 400 kHz\n");
+	hc_wr16(SDHCI_CLOCK_CONTROL, 0);
+	hc_wr(CORE_VENDOR_SPEC, CORE_VENDOR_SPEC_BOARD_VAL);
+	sdhci_set_legacy_host("probe step 2 (400 kHz)");
+
+	error = sdhci_gcc_set_apps(&mido_gcc_rates[MIDO_GCC_RATE_400K]);
+	if (error) {
+		printf("MIDO SDHCI: probe step 2: GCC 400 kHz failed (%d)\n",
+		    error);
+		return error;
+	}
+	printf("MIDO SDHCI: probe step 2: CLOCK_CONTROL 0x%04x "
+	    "HOST_CONTROL 0x%02x HOST_CONTROL2 0x%04x DLL_CONFIG 0x%08x "
+	    "(SDHCI divider ignored; UHS 0; 1-bit; DLL off)\n",
+	    hc_rd16(SDHCI_CLOCK_CONTROL), hc_rd8(SDHCI_HOST_CONTROL),
+	    hc_rd16(SDHCI_HOST_CONTROL2), hc_rd(CORE_DLL_CONFIG));
+
+	/*
+	 * At 400 kHz, 1 ms is 400 clocks: far more than the 74 clocks the
+	 * eMMC needs after power-up/reset before CMD1.
+	 */
+	delay(1000);
+
+	/*
+	 * First prove the inherited hand-off without resetting anything. If
+	 * CMD13 answers, the feedback-clock fix is already validated; the
+	 * card is in Transfer. CMD5 awake is still sent because LK may have
+	 * deselected or slept it first.
+	 */
+	error = sdhci_send_status(MIDO_CARD_RCA, &probe_r1);
+	if (!error) {
+		printf("MIDO SDHCI: probe step 2: CMD13 RCA 2 answered "
+		    "before reset: R1 0x%08x (state %u)\n", probe_r1,
+		    (probe_r1 >> 9) & 0xf);
+	} else {
+		printf("MIDO SDHCI: probe step 2: CMD13 RCA 2 failed "
+		    "before reset (%d)\n", error);
+	}
+
+	error = sdhci_sleep_awake(MIDO_CARD_RCA, &probe_r1);
+	if (!error) {
+		printf("MIDO SDHCI: probe step 2: CMD5 awake RCA 2 "
+		    "answered: R1 0x%08x\n", probe_r1);
+	} else {
+		(void)sdhci_reset_paths();
+		error = sdhci_sleep_awake(1, &probe_r1);
+		if (!error) {
+			printf("MIDO SDHCI: probe step 2: CMD5 awake RCA 1 "
+			    "answered: R1 0x%08x\n", probe_r1);
+		} else {
+			printf("MIDO SDHCI: probe step 2: CMD5 awake got "
+			    "no answer on RCA 2 or 1\n");
+			(void)sdhci_reset_paths();
+		}
+	}
+
+	/*
+	 * Reset the card to Idle and identify. CMD0 needs no response, so its
+	 * 146.5 us duration is the clock proof; CMD1 is the first command that
+	 * needs the receive path to work.
+	 */
+	err0 = sdhci_cmd(0, 0, 0, 0, NULL);
+	printf("MIDO SDHCI: probe step 2: CMD0 -> error %d, %llu ns\n",
+	    err0, (unsigned long long)se.last_cmd_ns);
+	if (err0) {
+		sdhci_recover();
+	}
+
+	err_cmd1 = sdhci_cmd1_poll(&probe_ocr);
+	if (err_cmd1) {
+		/*
+		 * JEDEC GO_PRE_IDLE_STATE. Linux's mmc_go_idle() uses arg 0
+		 * for a sleeping eMMC, so this is only a fallback, never the
+		 * primary reset; if CMD1 still fails the next suspect is the
+		 * host receive path, not another reset.
+		 */
+		printf("MIDO SDHCI: probe step 2: CMD1 failed (%d), one "
+		    "GO_PRE_IDLE retry (CMD0 0xf0f0f0f0)\n", err_cmd1);
+		err0 = sdhci_cmd(0, 0xf0f0f0f0u, 0, 0, NULL);
+		printf("MIDO SDHCI: probe step 2: CMD0 pre-idle -> "
+		    "error %d, %llu ns\n", err0,
+		    (unsigned long long)se.last_cmd_ns);
+		if (err0) {
+			sdhci_recover();
+		}
+		err_cmd1 = sdhci_cmd1_poll(&probe_ocr);
+	}
+	printf("MIDO SDHCI: probe step 2: CMD1 final -> error %d, "
+	    "OCR 0x%08x\n", err_cmd1, probe_ocr);
+
+	if (err_cmd1 == 0) {
+		error = sdhci_enumerate_card();
+		if (error) {
+			printf("MIDO SDHCI: enumeration failed (%d); "
+			    "leaving the card alone\n", error);
+			return error;
+		}
+	}
+	return 0;
+}
+
+static int
+sdhci_restore_controller(void)
+{
+	/*
+	 * After enumeration the card may be in 8-bit high-speed mode. Dropping
+	 * the host to the 400 kHz 1-bit path would make CMD13 work but corrupt
+	 * every data read, because the card would still drive eight data bits.
+	 * Fail closed instead; this legacy restore is only for the pre-CMD1
+	 * hand-off ladder.
+	 */
+	if (se.enumerated) {
+		printf("MIDO SDHCI: rung 3: refusing the legacy 1-bit "
+		    "restore after enumeration\n");
+		return ENXIO;
+	}
+	hc_wr(CORE_VENDOR_SPEC, CORE_VENDOR_SPEC_BOARD_VAL);
+	sdhci_select_hc_clock();
+	hc_wr8(SDHCI_HOST_CONTROL, se.saved_ctrl);
+	hc_wr16(SDHCI_HOST_CONTROL2, se.saved_hc2);
+	hc_wr8(SDHCI_TIMEOUT_CONTROL,
+	    se.saved_timeout ? se.saved_timeout : SDHCI_TIMEOUT_MAX);
+	/*
+	 * A RESET_ALL wiped HOST_CONTROL2 back to 0, and the saved hand-off
+	 * value is UHS=3 (SDR104) with an 8-bit bus. Do not put the receive
+	 * path back into that state: rebuild the 400 kHz legacy mode instead.
+	 */
+	sdhci_set_legacy_host("rung 3 controller restore");
+	if (sdhci_set_bus_power() != 0) {
+		printf("MIDO SDHCI: rung 3: bus power not restored\n");
+		return ENXIO;
+	}
+	hc_wr(SDHCI_INT_ENABLE, 0xffffffffu);
+	hc_wr(SDHCI_SIGNAL_ENABLE, 0);
+	hc_wr(SDHCI_INT_STATUS, hc_rd(SDHCI_INT_STATUS));
+	if (sdhci_gcc_set_apps(&mido_gcc_rates[MIDO_GCC_RATE_400K]) != 0) {
+		printf("MIDO SDHCI: rung 3: 400 kHz clock not restored\n");
+		return ENXIO;
+	}
+	sdhci_clock_output();
+	return sdhci_reset_paths();
+}
+
+/*
+ * CMD13 SEND_STATUS: the cheap proof that a card is selected and answering.
+ * arg is rca << 16 (Linux include/linux/mmc/mmc.h: "ac [31:16] RCA R1"). A
+ * timed-out command leaves CMD_INHIBIT set on this core, so the command path
+ * is reset before the next probe rung: writing INT_STATUS alone is not enough.
+ */
+static int
+sdhci_send_status(uint32_t rca, uint32_t *r1)
+{
+	int error;
+
+	error = sdhci_cmd(13, rca << 16, 0,
+	    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, r1);
+	if (error) {
+		sdhci_recover();
+	}
+	return error;
+}
+
+/* CMD7: select one card by RCA (Standby -> Transfer). */
+static int
+sdhci_select_card(uint32_t rca)
+{
+	return sdhci_cmd(7, rca << 16, 0,
+	    SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, NULL);
+}
+
+/*
+ * CMD5 SLEEP_AWAKE with SLEEP_AWAKE=0: wake a card LK may have put to sleep.
+ * LK's mmc_put_card_to_sleep() deselects with CMD7 arg 0 and then sends CMD5
+ * with bit 15 set; a sleeping card ignores CMD13 but answers CMD5, and the
+ * R1b response repeats the RCA in bits 31:16.
+ */
+static int
+sdhci_sleep_awake(uint32_t rca, uint32_t *r1)
+{
+	return sdhci_cmd(5, rca << 16, 0,
+	    SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, r1);
+}
+
+/*
+ * CMD6 is R1b: the card holds DAT0 low while it programs EXT_CSD. The SDHCI
+ * core does not wait for that busy phase itself, and sending CMD13 into it
+ * would time out and leave CMD_INHIBIT set. Poll PRESENT_STATE until the
+ * command/data inhibitors are clear and DAT0 is high, then confirm TRAN with
+ * one CMD13. The 1 ms pre-delay lets the card actually enter the busy phase;
+ * eMMC CMD6 busy can otherwise be missed by an immediate read.
+ */
+static int
+sdhci_wait_card_ready(uint32_t rca, const char *what)
+{
+	uint32_t st, r1 = 0;
+	uint64_t deadline;
+	int error;
+
+	nanoseconds_to_absolutetime(CMD6_BUSY_TIMEOUT_NS, &deadline);
+	deadline += mach_absolute_time();
+
+	delay(1000);
+	for (;;) {
+		st = hc_rd(SDHCI_PRESENT_STATE);
+		if (!(st & (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT)) &&
+		    (st & SDHCI_DATA_0_LVL_MASK)) {
+			break;
+		}
+		if (mach_absolute_time() > deadline) {
+			printf("MIDO SDHCI: enumeration: %s: DAT0 did not "
+			    "release within 1 s (PRESENT_STATE 0x%08x)\n",
+			    what, st);
+			return ETIMEDOUT;
+		}
+		delay(1000);
+	}
+
+	error = sdhci_cmd(13, rca << 16, 0,
+	    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, &r1);
+	if (error) {
+		printf("MIDO SDHCI: enumeration: %s: CMD13 confirmation "
+		    "failed (%d)\n", what, error);
+		return error;
+	}
+	if ((r1 & SDHCI_R1_STATE_MASK) != (SDHCI_R1_STATE_TRAN << 9) ||
+	    !(r1 & SDHCI_R1_READY_FOR_DATA)) {
+		printf("MIDO SDHCI: enumeration: %s: card not ready "
+		    "(R1 0x%08x, state %u)\n", what, r1,
+		    (r1 & SDHCI_R1_STATE_MASK) >> 9);
+		return EIO;
+	}
+	printf("MIDO SDHCI: enumeration: %s: card ready "
+	    "(R1 0x%08x, TRAN)\n", what, r1);
+	return 0;
+}
+
+/*
+ * CMD6 SWITCH write-byte. The host bus/timing change is applied immediately
+ * after the response, before the busy phase ends: the card has already been
+ * told the new mode, and the next CMD13/data phase must use it. ctrl_clear is
+ * used for the mutually exclusive 4/8-bit field; ctrl_set is 8BITBUS or HISPD.
+ */
+static int
+sdhci_switch_ext_csd(uint8_t index, uint8_t value, uint8_t ctrl_set,
+    uint8_t ctrl_clear, const char *what)
+{
+	uint32_t arg = (EXT_CSD_WRITE_BYTE << 24) |
+	    ((uint32_t)index << 16) | ((uint32_t)value << 8) |
+	    EXT_CSD_CMD_SET_NORMAL;
+	uint32_t r1 = 0;
+	uint8_t ctrl;
+	int error;
+
+	printf("MIDO SDHCI: enumeration: CMD6 %s (arg 0x%08x)\n",
+	    what, arg);
+	error = sdhci_cmd(6, arg, 0,
+	    SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
+	    &r1);
+	if (error) {
+		printf("MIDO SDHCI: enumeration: CMD6 %s failed (%d)\n",
+		    what, error);
+		return error;
+	}
+	printf("MIDO SDHCI: enumeration: CMD6 %s -> R1 0x%08x\n",
+	    what, r1);
+	if (r1 & SDHCI_R1_SWITCH_ERROR) {
+		/*
+		 * The card rejected the EXT_CSD byte. Do not touch
+		 * HOST_CONTROL: the card is still in its old bus/timing mode.
+		 */
+		printf("MIDO SDHCI: enumeration: CMD6 %s reported "
+		    "SWITCH_ERROR, host left unchanged\n", what);
+		return EIO;
+	}
+
+	ctrl = hc_rd8(SDHCI_HOST_CONTROL);
+	ctrl = (uint8_t)((ctrl & ~ctrl_clear) | ctrl_set);
+	hc_wr8(SDHCI_HOST_CONTROL, ctrl);
+	ctrl = hc_rd8(SDHCI_HOST_CONTROL);
+	printf("MIDO SDHCI: enumeration: HOST_CONTROL 0x%02x after "
+	    "%s\n", ctrl, what);
+	if ((ctrl & ctrl_set) != ctrl_set) {
+		printf("MIDO SDHCI: enumeration: HOST_CONTROL did not "
+		    "latch %s (0x%02x)\n", what, ctrl);
+		return ENXIO;
+	}
+
+	return sdhci_wait_card_ready(se.rca, what);
+}
+
+/*
+ * READY -> IDENT -> STBY -> TRAN and the 25 MHz / 8-bit / high-speed switch.
+ *
+ * CMD1 leaves the card in READY with no RCA: CMD3 assigns RCA 2, CMD9/CMD10
+ * are addressed R2 reads, CMD7 selects it, and CMD8 reads EXT_CSD while the
+ * card and host are still 1-bit at 400 kHz. Only after the 512-byte EXT_CSD
+ * read succeeds do we move to 25 MHz and use CMD6 to change the card's bus
+ * width and timing; the host follows immediately after each CMD6 response.
+ * These are configuration writes to EXT_CSD, not user-data writes.
+ */
+static int
+sdhci_enumerate_card(void)
+{
+	uint32_t cid[4] = { 0 }, csd[4] = { 0 };
+	uint32_t sec_count = 0, r1 = 0;
+	char pnm[7];
+	int error;
+
+	printf("MIDO SDHCI: enumeration: CMD2 ALL_SEND_CID (R2)\n");
+	error = sdhci_read_response128(2, 0, cid);
+	if (error) {
+		printf("MIDO SDHCI: enumeration: CMD2 failed (%d)\n", error);
+		return error;
+	}
+	printf("MIDO SDHCI: enumeration: CID 0x%08x 0x%08x 0x%08x "
+	    "0x%08x\n", cid[0], cid[1], cid[2], cid[3]);
+
+	printf("MIDO SDHCI: enumeration: CMD3 SET_RELATIVE_ADDR RCA %u\n",
+	    MIDO_CARD_RCA);
+	error = sdhci_cmd(3, MIDO_CARD_RCA << 16, 0,
+	    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, &r1);
+	if (error) {
+		printf("MIDO SDHCI: enumeration: CMD3 failed (%d)\n", error);
+		return error;
+	}
+	se.rca = MIDO_CARD_RCA;
+	printf("MIDO SDHCI: enumeration: CMD3 -> R1 0x%08x (state %u)\n",
+	    r1, (r1 & SDHCI_R1_STATE_MASK) >> 9);
+
+	printf("MIDO SDHCI: enumeration: CMD9 SEND_CSD RCA %u (R2)\n",
+	    se.rca);
+	error = sdhci_read_response128(9, se.rca << 16, csd);
+	if (error) {
+		printf("MIDO SDHCI: enumeration: CMD9 failed (%d)\n", error);
+		return error;
+	}
+	printf("MIDO SDHCI: enumeration: CSD 0x%08x 0x%08x 0x%08x "
+	    "0x%08x\n", csd[0], csd[1], csd[2], csd[3]);
+
+	pnm[0] = (char)(cid[0] & 0xff);
+	pnm[1] = (char)(cid[1] >> 24);
+	pnm[2] = (char)(cid[1] >> 16);
+	pnm[3] = (char)(cid[1] >> 8);
+	pnm[4] = (char)cid[1];
+	pnm[5] = (char)(cid[2] >> 24);
+	pnm[6] = 0;
+	for (int i = 0; i < 6; i++) {
+		if (pnm[i] < 0x20 || pnm[i] > 0x7e) {
+			pnm[i] = '.';
+		}
+	}
+	printf("MIDO SDHCI: eMMC MID 0x%02x CBX 0x%02x OID 0x%02x "
+	    "PNM \"%s\" rev %u.%u S/N 0x%08x MDT 0x%02x CSD 0x%08x\n",
+	    (cid[0] >> 24) & 0xff, (cid[0] >> 16) & 0xff,
+	    (cid[0] >> 8) & 0xff, pnm, (cid[2] >> 20) & 0xf,
+	    (cid[2] >> 16) & 0xf,
+	    ((cid[2] & 0xffffu) << 16) | (cid[3] >> 16),
+	    (cid[3] >> 8) & 0xff, csd[0]);
+
+	printf("MIDO SDHCI: enumeration: CMD7 SELECT_CARD RCA %u\n",
+	    se.rca);
+	error = sdhci_select_card(se.rca);
+	if (error) {
+		printf("MIDO SDHCI: enumeration: CMD7 failed (%d)\n", error);
+		return error;
+	}
+	printf("MIDO SDHCI: enumeration: card selected (TRAN)\n");
+
+	printf("MIDO SDHCI: enumeration: CMD8 SEND_EXT_CSD "
+	    "(512-byte read at 400 kHz)\n");
+	dma_sync(SDHCI_BLOCK, TRUE);
+	error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));
+	if (error) {
+		printf("MIDO SDHCI: enumeration: CMD8 failed (%d)\n", error);
+		return error;
+	}
+	dma_sync(SDHCI_BLOCK, TRUE);
+	memcpy(&sec_count, (const void *)(se.dma + DMA_BOUNCE + 212), 4);
+	if (sec_count == 0) {
+		printf("MIDO SDHCI: enumeration: EXT_CSD SEC_COUNT is 0; "
+		    "CMD8 data is not trustworthy, not switching the bus\n");
+		return EIO;
+	}
+	se.sec_count = sec_count;
+	printf("MIDO SDHCI: enumeration: EXT_CSD SEC_COUNT %u "
+	    "(%llu MiB)\n", sec_count,
+	    (unsigned long long)((uint64_t)sec_count * SDHCI_BLOCK >> 20));
+
+	printf("MIDO SDHCI: enumeration: switch GCC to 25 MHz\n");
+	error = sdhci_gcc_set_apps(&mido_gcc_rates[MIDO_GCC_RATE_25M]);
+	if (error) {
+		printf("MIDO SDHCI: enumeration: 25 MHz failed (%d)\n",
+		    error);
+		return error;
+	}
+	printf("MIDO SDHCI: enumeration: CLOCK_CONTROL 0x%04x "
+	    "HOST_CONTROL 0x%02x HOST_CONTROL2 0x%04x\n",
+	    hc_rd16(SDHCI_CLOCK_CONTROL), hc_rd8(SDHCI_HOST_CONTROL),
+	    hc_rd16(SDHCI_HOST_CONTROL2));
+	sdhci_clock_output();
+
+	error = sdhci_switch_ext_csd(EXT_CSD_BUS_WIDTH,
+	    EXT_CSD_BUS_WIDTH_8, SDHCI_CTRL_8BITBUS, SDHCI_CTRL_BUS_MASK,
+	    "BUS_WIDTH=8");
+	if (error) {
+		return error;
+	}
+
+	error = sdhci_switch_ext_csd(EXT_CSD_HS_TIMING,
+	    EXT_CSD_TIMING_HS, SDHCI_CTRL_HISPD, 0, "HS_TIMING=1");
+	if (error) {
+		return error;
+	}
+
+	se.enumerated = true;
+	printf("MIDO SDHCI: enumeration complete: 25 MHz, 8-bit, "
+	    "high-speed\n");
+	return 0;
+}
+
+/*
+ * The bootloader does not necessarily hand the card over in Transfer state:
+ * LK deselects before sleeping it, so Standby (3) and Sleep (5) are both
+ * plausible. Repair with the one command that fits and re-check; each branch
+ * is logged, so the boot log says which state the hand-off was in.
+ */
+static int
+sdhci_restore_state(uint32_t *r1)
+{
+	for (int step = 0; step < 3; step++) {
+		uint32_t state = (*r1 >> 9) & 0xf;
+
+		if (state == 4) {               /* TRAN: usable */
+			return 0;
+		}
+		printf("MIDO SDHCI: card state %u (not TRAN), R1 0x%08x\n",
+		    state, *r1);
+		if (state == 3) {
+			printf("MIDO SDHCI: selecting RCA %u (CMD7)\n",
+			    se.rca);
+			if (sdhci_select_card(se.rca) != 0) {
+				return EIO;
+			}
+		} else if (state == 5) {
+			printf("MIDO SDHCI: waking RCA %u (CMD5 "
+			    "SLEEP_AWAKE)\n", se.rca);
+			if (sdhci_sleep_awake(se.rca, r1) != 0) {
+				return EIO;
+			}
+		} else {
+			printf("MIDO SDHCI: no repair for card state %u\n",
+			    state);
+			return ENXIO;
+		}
+		if (sdhci_send_status(se.rca, r1) != 0) {
+			return EIO;
+		}
+	}
 	return ENXIO;
 }
+
+/*
+ * Find the RCA the card answers on. The bootloader assigned it in CMD3, and
+ * Qualcomm LK/ABL use MMC_RCA 2 (bootloader_lk include/mmc.h), but that is
+ * checked rather than assumed: an addressed command with the wrong RCA gets no
+ * response at all, which is exactly the "command 13 timed out" seen on
+ * hardware. The ladder is ordered by cost; every rung is logged so that one
+ * boot log identifies the culprit:
+ *
+ *   1. CMD13 with RCA 2              - the LK/ABL address
+ *   2. CMD13 with RCA 1              - the other address on a one-card bus
+ *   3. CORE_VENDOR_SPEC <- POR and   - what Linux writes at probe and on
+ *      the HC MCLK re-selected        every rate change, re-asserted here
+ *   4. CMD5 awake, RCA 2 then RCA 1  - the card may be asleep
+ *   5. CMD0                          - clock test; resets the card, so last
+ */
+static int
+sdhci_claim_card(void)
+{
+	static const uint32_t candidates[] = { MIDO_CARD_RCA, 1u };
+	uint32_t r1 = 0;
+	int error = ETIMEDOUT;
+	unsigned i;
+
+	/*
+	 * Enumeration already selected the card and moved it to 25 MHz/8-bit/
+	 * high-speed. The ladder below is for LK's 400 kHz hand-off. If CMD13
+	 * fails now, do not rebuild the 1-bit legacy path: the card would still
+	 * be driving eight data bits, so any later read would be garbage.
+	 */
+	if (se.enumerated) {
+		error = sdhci_send_status(se.rca, &r1);
+		if (!error) {
+			return sdhci_restore_state(&r1);
+		}
+		printf("MIDO SDHCI: post-enumeration CMD13 failed (%d); "
+		    "not downgrading the card bus\n", error);
+		return ENXIO;
+	}
+
+	for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+		error = sdhci_send_status(candidates[i], &r1);
+		if (!error) {
+			break;
+		}
+		printf("MIDO SDHCI: CMD13 with RCA %u got no answer\n",
+		    candidates[i]);
+	}
+	if (!error) {
+		se.rca = candidates[i];
+		printf("MIDO SDHCI: card answered CMD13 on RCA %u "
+		    "(R1 0x%08x, state %u)\n", se.rca, r1, (r1 >> 9) & 0xf);
+		return sdhci_restore_state(&r1);
+	}
+
+	/*
+	 * Rung 3: rebuild the controller. An SDHCI reset wipes
+	 * POWER_CONTROL, CLOCK_CONTROL, HOST_CONTROL, HOST_CONTROL2,
+	 * TIMEOUT_CONTROL and the interrupt enables; only GCC and the vendor
+	 * window survive. Re-writing just CORE_VENDOR_SPEC (the old rung)
+	 * left the core unpowered and unclocked, and a bare POR value also
+	 * cleared LK's pad power bits. Nothing has answered at this point,
+	 * so a full restore cannot cost a working card.
+	 */
+	printf("MIDO SDHCI: rung 3: restoring the controller "
+	    "(VENDOR_SPEC 0x%08x, CLOCK_CONTROL 0x%04x, POWER_CONTROL 0x%02x, "
+	    "HOST_CONTROL 0x%02x, HOST_CONTROL2 0x%04x, TIMEOUT 0x%02x)\n",
+	    hc_rd(CORE_VENDOR_SPEC), hc_rd16(SDHCI_CLOCK_CONTROL),
+	    hc_rd8(SDHCI_POWER_CONTROL), hc_rd8(SDHCI_HOST_CONTROL),
+	    hc_rd16(SDHCI_HOST_CONTROL2), hc_rd8(SDHCI_TIMEOUT_CONTROL));
+	if (sdhci_restore_controller() == 0) {
+		if (sdhci_send_status(MIDO_CARD_RCA, &r1) == 0) {
+			se.rca = MIDO_CARD_RCA;
+			printf("MIDO SDHCI: CMD13 answers on RCA %u after "
+			    "the controller restore (R1 0x%08x, state %u)\n",
+			    se.rca, r1, (r1 >> 9) & 0xf);
+			return sdhci_restore_state(&r1);
+		}
+		printf("MIDO SDHCI: rung 3: still no CMD13 after a full "
+		    "controller restore; the card may have lost VCC/RST_n and "
+		    "need CMD0 re-enumeration\n");
+	} else {
+		printf("MIDO SDHCI: rung 3: controller restore failed, "
+		    "continuing with the card-state rungs\n");
+	}
+
+	/*
+	 * Rung 4: SLEEP. A sleeping card answers CMD5 but not CMD13, and the
+	 * CMD5 response repeats the RCA, so both candidate addresses are
+	 * tried and the one that answers wins.
+	 */
+	for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+		error = sdhci_sleep_awake(candidates[i], &r1);
+		if (error) {
+			(void)sdhci_reset_paths();
+			continue;
+		}
+		printf("MIDO SDHCI: CMD5 awake RCA %u -> R1 0x%08x\n",
+		    candidates[i], r1);
+		se.rca = candidates[i];
+		if (sdhci_send_status(se.rca, &r1) != 0) {
+			continue;
+		}
+		printf("MIDO SDHCI: CMD13 after wake-up (R1 0x%08x, "
+		    "state %u)\n", r1, (r1 >> 9) & 0xf);
+		return sdhci_restore_state(&r1);
+	}
+
+	/*
+	 * Rung 5: CMD0 needs no response. It separates "the command path never
+	 * shifted" from "the card does not answer", and it sends the card back
+	 * to Idle, so it is the very last thing this probe does. Re-identifying
+	 * the card from Idle is a later patch, not this one.
+	 */
+	if (sdhci_cmd(0, 0, 0, 0, NULL) == 0) {
+		printf("MIDO SDHCI: CMD0 completed: the command path shifts, "
+		    "but no addressed command answered\n");
+	} else {
+		printf("MIDO SDHCI: CMD0 did not complete either: no SDCLK "
+		    "reaches the card\n");
+	}
+	return ENXIO;
+}
+
+/*
+ * Verify that the 25 MHz 8-bit High-Speed switch is functionally working
+ * across the 8 data lines (DAT[7:0]) by re-reading EXT_CSD (CMD8) and
+ * verifying that SEC_COUNT and HS_TIMING match expectations.
+ *
+ * (Note: Per JEDEC JESD84-B51, EXT_CSD[183] BUS_WIDTH is write-only and reads
+ * back 0x00, so we check EXT_CSD[185] HS_TIMING == 1 and SEC_COUNT).
+ *
+ * If 8-bit High-Speed sampling fails, fall back to legacy edge timing
+ * (HS_TIMING=0) or 4-bit bus width.
+ */
+static int
+sdhci_verify_highspeed_bus(uint32_t expected_sec_count)
+{
+	uint32_t verify_sec_count = 0;
+	uint8_t hs_timing = 0;
+	int error;
+
+	/* Re-read EXT_CSD (CMD8) at 25 MHz 8-bit High-Speed to exercise DAT[7:0] */
+	dma_sync(SDHCI_BLOCK, TRUE);
+	error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));
+	if (error == 0) {
+		dma_sync(SDHCI_BLOCK, TRUE);
+		memcpy(&verify_sec_count, (const void *)(se.dma + DMA_BOUNCE + 212), 4);
+		hs_timing = *(const uint8_t *)(se.dma + DMA_BOUNCE + 185);
+
+		if (verify_sec_count == expected_sec_count && hs_timing == 1) {
+			printf("MIDO SDHCI: DAT[7:0] 8-bit HS verified "
+			    "(SEC_COUNT %u, HS_TIMING %u)\n",
+			    verify_sec_count, hs_timing);
+			return 0;
+		}
+		printf("MIDO SDHCI: EXT_CSD mismatch at 8-bit HS (got %u vs %u, HS=%u)\n",
+		    verify_sec_count, expected_sec_count, hs_timing);
+	} else {
+		printf("MIDO SDHCI: EXT_CSD read failed at 8-bit HS (%d)\n", error);
+	}
+
+	/* Fallback 1: Disable Host High-Speed edge mode & revert card HS_TIMING=0 */
+	printf("MIDO SDHCI: rolling back HS_TIMING to legacy edge at 25 MHz\n");
+	(void)sdhci_switch_ext_csd(EXT_CSD_HS_TIMING, 0, 0, SDHCI_CTRL_HISPD, "HS_TIMING=0");
+
+	dma_sync(SDHCI_BLOCK, TRUE);
+	error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));
+	if (error == 0) {
+		dma_sync(SDHCI_BLOCK, TRUE);
+		memcpy(&verify_sec_count, (const void *)(se.dma + DMA_BOUNCE + 212), 4);
+		if (verify_sec_count == expected_sec_count) {
+			printf("MIDO SDHCI: DAT[7:0] 8-bit legacy edge verified (SEC_COUNT %u)\n",
+			    verify_sec_count);
+			return 0;
+		}
+	}
+
+	/* Fallback 2: Drop from 8-bit to 4-bit bus width */
+	printf("MIDO SDHCI: rolling back bus width to 4-bit\n");
+	(void)sdhci_switch_ext_csd(EXT_CSD_BUS_WIDTH, EXT_CSD_BUS_WIDTH_4,
+	    SDHCI_CTRL_4BITBUS, SDHCI_CTRL_BUS_MASK, "BUS_WIDTH=4");
+
+	dma_sync(SDHCI_BLOCK, TRUE);
+	error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));
+	if (error == 0) {
+		dma_sync(SDHCI_BLOCK, TRUE);
+		memcpy(&verify_sec_count, (const void *)(se.dma + DMA_BOUNCE + 212), 4);
+		if (verify_sec_count == expected_sec_count) {
+			printf("MIDO SDHCI: 4-bit bus verified (SEC_COUNT %u)\n",
+			    verify_sec_count);
+			return 0;
+		}
+	}
+	return EIO;
+}
+
+static int
+mido_sdhci_read_blocks(uint64_t lba, uint32_t count, void *buf)
+{
+	if (count == 0 || count > BOUNCE_SIZE / SDHCI_BLOCK || lba > UINT32_MAX) {
+		return EINVAL;
+	}
+	if (se.sec_count && lba + (uint64_t)count > se.sec_count) {
+		printf("MIDO SDHCI: refusing read of %u blocks at 0x%llx "
+		    "(device has %u sectors)\n", count, (unsigned long long)lba,
+		    se.sec_count);
+		return EINVAL;
+	}
+	return sdhci_read_pio(count == 1 ? 17 : 18, (uint32_t)lba, count, buf);
+}
+
+static int
+mido_sdhci_write_blocks(uint64_t lba, uint32_t count, const void *buf)
+{
+	uint64_t off;
+
+	if (!se.writable) {
+		return EROFS;
+	}
+	if (count == 0 || count > BOUNCE_SIZE / SDHCI_BLOCK ||
+	    lba < se.first_block || lba > UINT32_MAX) {
+		goto refuse;
+	}
+	off = lba - se.first_block;
+	if (off >= se.nblocks || count > se.nblocks - off) {
+		goto refuse;
+	}
+	if (se.sec_count && lba + (uint64_t)count > se.sec_count) {
+		printf("MIDO SDHCI: refusing write of %u blocks at 0x%llx "
+		    "(device has %u sectors)\n", count, (unsigned long long)lba,
+		    se.sec_count);
+		return EINVAL;
+	}
+	return sdhci_write_pio((uint32_t)lba, count, buf);
+
+refuse:
+	printf("MIDO SDHCI: refusing write of %u blocks at 0x%llx "
+	    "(outside \"%s\")\n", count, (unsigned long long)lba, se.part);
+	return EPERM;
+}
+
+/*
+ * UEFI 2.8 GPT header (section 5.3.1), 92 bytes on the wire. Only used to
+ * decode the fields we validate; the CRC32 is computed over the raw bytes.
+ */
+struct mido_gpt_header {
+	char signature[8];                      /* "EFI PART" */
+	uint32_t revision;
+	uint32_t header_size;                   /* 92 */
+	uint32_t header_crc32;                  /* CRC32 with this field zeroed */
+	uint32_t reserved;
+	uint64_t my_lba;
+	uint64_t alternate_lba;
+	uint64_t first_usable_lba;
+	uint64_t last_usable_lba;
+	uint8_t disk_guid[16];
+	uint64_t partition_entry_lba;
+	uint32_t num_partition_entries;
+	uint32_t sizeof_partition_entry;         /* 128 */
+	uint32_t partition_entry_array_crc32;
+} __attribute__((packed));
+
+/*
+ * IEEE 802.3 CRC32 (reflected, polynomial 0xEDB88320). Matches the UEFI
+ * specification, tests/test_gpt_parser.c and every other GPT implementation.
+ */
+static uint32_t
+mido_crc32(const uint8_t *data, size_t len)
+{
+	uint32_t crc = 0xFFFFFFFFu;
+
+	for (size_t i = 0; i < len; i++) {
+		crc ^= data[i];
+		for (int bit = 0; bit < 8; bit++) {
+			crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+		}
+	}
+	return ~crc;
+}
+
+/*
+ * Validate the GPT and look up both partitions we care about:
+ *  - "userdata" (or the emmcroot= override) becomes the BSD disk emmcroot0
+ *    (se.first_block / se.nblocks),
+ *  - "system" is kept only as the persistent console log area
+ *    (se.sys_first_block / se.sys_nblocks); it is intentionally not exposed
+ *    as a BSD device.
+ * The primary header is verified with its own CRC32 (header_crc32 zeroed) and
+ * the partition entry array with the CRC32 over num_entries * entry_size.
+ */
+static int
+mido_sdhci_find_partition(const char *want)
+{
+	const uint8_t *b = (const uint8_t *)(se.dma + DMA_BOUNCE);
+	struct mido_gpt_header hdr;
+	uint8_t hdr_raw[SDHCI_BLOCK];
+	uint64_t entry_lba;
+	uint32_t nent, esz, entry_bytes, entry_blocks;
+	bool root_found = false;
+	uint64_t sys_first = 0, sys_count = 0;
+	bool sys_found = false;
+	int error;
+
+	error = mido_sdhci_read_blocks(1, 1, (void *)b);
+	if (error) {
+		return error;
+	}
+	if (memcmp(b, "EFI PART", 8) != 0) {
+		printf("MIDO SDHCI: eMMC has no GPT\n");
+		return ENXIO;
+	}
+	memcpy(&hdr, b, sizeof(hdr));
+	if (hdr.header_size < sizeof(hdr) || hdr.header_size > SDHCI_BLOCK) {
+		printf("MIDO SDHCI: bad GPT header size %u\n", hdr.header_size);
+		return EINVAL;
+	}
+	/* header_crc32 lives at offset 16 of the header */
+	memcpy(hdr_raw, b, SDHCI_BLOCK);
+	memset(hdr_raw + 16, 0, 4);
+	if (mido_crc32(hdr_raw, hdr.header_size) != hdr.header_crc32) {
+		printf("MIDO SDHCI: GPT header CRC32 mismatch "
+		    "(stored 0x%08x)\n", hdr.header_crc32);
+		return EBADMSG;
+	}
+
+	esz = hdr.sizeof_partition_entry;
+	nent = hdr.num_partition_entries;
+	if (esz != 128 || nent == 0 || nent > BOUNCE_SIZE / esz) {
+		printf("MIDO SDHCI: unsupported GPT entries %u x %u\n", nent, esz);
+		return ENXIO;
+	}
+	entry_lba = hdr.partition_entry_lba;
+	entry_bytes = nent * esz;
+	entry_blocks = (entry_bytes + SDHCI_BLOCK - 1) / SDHCI_BLOCK;
+	error = mido_sdhci_read_blocks(entry_lba, entry_blocks, (void *)b);
+	if (error) {
+		return error;
+	}
+	if (mido_crc32(b, entry_bytes) != hdr.partition_entry_array_crc32) {
+		printf("MIDO SDHCI: GPT entry array CRC32 mismatch "
+		    "(stored 0x%08x)\n", hdr.partition_entry_array_crc32);
+		return EBADMSG;
+	}
+
+	for (uint32_t i = 0; i < nent; i++) {
+		const uint8_t *e = b + (uint64_t)i * esz;
+		char name[37];
+		uint64_t first, last;
+		unsigned c;
+
+		for (c = 0; c < 36; c++) {
+			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
+			if (ch == 0 || ch > 0x7f) {
+				break;
+			}
+			name[c] = (char)ch;
+		}
+		name[c] = 0;
+		if (c == 0) {
+			continue;
+		}
+		memcpy(&first, e + 32, 8);
+		memcpy(&last, e + 40, 8);
+		if (last < first) {
+			printf("MIDO SDHCI: GPT entry \"%s\" has inverted "
+			    "bounds 0x%llx..0x%llx\n", name,
+			    (unsigned long long)last, (unsigned long long)first);
+			return ENXIO;
+		}
+		if (strcmp(name, "system") == 0) {
+			sys_first = first;
+			sys_count = last - first + 1;
+			sys_found = true;
+			continue;
+		}
+		if (strcmp(name, want) == 0) {
+			se.first_block = first;
+			se.nblocks = last - first + 1;
+			root_found = true;
+		}
+	}
+	if (!root_found) {
+		printf("MIDO SDHCI: no GPT partition named \"%s\"\n", want);
+		return ENOENT;
+	}
+
+	se.sys_first_block = 0;
+	se.sys_nblocks = 0;
+	se.log_ok = false;
+	if (sys_found && sys_count >= MIDO_LOG_SYSTEM_BLOCKS) {
+		uint64_t root_end = se.first_block + se.nblocks;
+		uint64_t sys_end = sys_first + sys_count;
+
+		/* Equality is not enough: a double-booked or nested "system"
+		 * entry would put log writes on the mounted root. */
+		if (sys_first < root_end && se.first_block < sys_end) {
+			printf("MIDO SDHCI: \"system\" (0x%llx..0x%llx) "
+			    "overlaps \"%s\" (0x%llx..0x%llx): persistent log "
+			    "disabled\n",
+			    (unsigned long long)sys_first,
+			    (unsigned long long)(sys_end - 1), se.part,
+			    (unsigned long long)se.first_block,
+			    (unsigned long long)(root_end - 1));
+		} else {
+			se.sys_first_block = sys_first;
+			se.sys_nblocks = sys_count;
+			se.log_ok = true;
+		}
+	} else if (sys_found) {
+		printf("MIDO SDHCI: \"system\" too small for the log "
+		    "(%llu sectors, need %u)\n",
+		    (unsigned long long)sys_count, MIDO_LOG_SYSTEM_BLOCKS);
+	}
+	return 0;
+}
+
+/*
+ * Raw sector writes for the persistent console log flusher
+ * (xnu/patches/0143). This is the only write path that does not require
+ * boot-arg emmcrw=1 and it is fenced hard to the SYSTEM partition log area:
+ * sectors [sys_first_block, sys_first_block + 8193), which can only ever
+ * touch the 36-byte header and the 4 MiB ring - never a filesystem.
+ */
+int mido_sdhci_write_log_blocks(uint64_t lba, uint32_t count,
+    const void *buf);
+
+int
+mido_sdhci_write_log_blocks(uint64_t lba, uint32_t count, const void *buf)
+{
+	int error;
+
+	/* Off when there is no SYSTEM partition, it is too small, or it
+	 * overlaps the root (see mido_sdhci_find_partition()). */
+	if (!se.log_ok) {
+		return EPERM;
+	}
+	if (count == 0 || count > BOUNCE_SIZE / SDHCI_BLOCK) {
+		return EINVAL;
+	}
+	if (se.sys_nblocks < MIDO_LOG_SYSTEM_BLOCKS ||
+	    lba < se.sys_first_block ||
+	    lba + (uint64_t)count >
+	    se.sys_first_block + MIDO_LOG_SYSTEM_BLOCKS ||
+	    lba > UINT32_MAX) {
+		printf("MIDO SDHCI: refusing log write of %u blocks at "
+		    "0x%llx (SYSTEM log is 0x%llx..0x%llx)\n", count,
+		    (unsigned long long)lba,
+		    (unsigned long long)se.sys_first_block,
+		    (unsigned long long)(se.sys_first_block +
+		    MIDO_LOG_SYSTEM_BLOCKS - 1));
+		return EPERM;
+	}
+
+	/*
+	 * WR-01: the caller passes a pointer into the static log ring, never
+	 * se.dma + DMA_BOUNCE. strategy() owns that bounce buffer under this
+	 * lock; staging the ring into it from the flusher (outside the lock,
+	 * as 0143 used to) let a console flush overwrite a mounted-root write
+	 * in flight. The ring is read here, under the same lock as the PIO.
+	 */
+	lck_mtx_lock(&mido_sdhci_lock);
+	error = sdhci_write_pio((uint32_t)lba, count, buf);
+	lck_mtx_unlock(&mido_sdhci_lock);
+	return error;
+}
+
+static int
+mido_sdhci_open(__unused dev_t dev, int flags, __unused int devtype,
+    __unused struct proc *p)
+{
+	if (!se.ready) {
+		return ENXIO;
+	}
+	return (flags & FWRITE) && !se.writable ? EROFS : 0;
+}
+
+static int
+mido_sdhci_close(__unused dev_t dev, __unused int flags,
+    __unused int devtype, __unused struct proc *p)
+{
+	return 0;
+}
+
+/*
+ * Is this a kernel VA? buf_map() returns bp->b_datap unchanged for a
+ * non-clustered buffer, so a B_PHYS buffer carries the (user) address that
+ * physio() put there. Kernel VAs live in the high canonical half on arm64.
+ */
+static inline bool
+mido_kernel_address(caddr_t addr)
+{
+	return (uintptr_t)addr >= VM_MIN_KERNEL_ADDRESS;
+}
+
+static void
+mido_sdhci_strategy(buf_t bp)
+{
+	int error = 0;
+	caddr_t vaddr = NULL;
+	uint64_t off = (uint64_t)buf_blkno(bp) * se.secsize;
+	uint32_t count = buf_count(bp);
+	uint64_t part_bytes = se.nblocks * SDHCI_BLOCK;
+	bool rd = (buf_flags(bp) & B_READ) != 0;
+	bool user;
+
+	buf_setresid(bp, count);
+	if (!rd && !se.writable) {
+		error = EROFS;
+		goto done;
+	}
+	if (off > part_bytes || count > part_bytes - off) {
+		error = EINVAL;
+		goto done;
+	}
+	if (count == 0) {
+		goto done;
+	}
+	if (buf_map(bp, &vaddr)) {
+		error = EIO;
+		goto done;
+	}
+
+	/*
+	 * Normal VFS I/O passes kernel-mapped buffers (or UPL-backed B_CLUSTER
+	 * buffers), for which memcpy() is correct. A B_PHYS buffer without
+	 * B_CLUSTER is different: physio() only vslock()s the pages and leaves
+	 * a raw user VA in b_datap. Such a page can still be mapped read-only
+	 * with PP_ATTR_MODFAULT, so an EL1 store is a permission fault that
+	 * handle_kernel_abort() cannot recover (it looks the address up in
+	 * kernel_map). Use copyin()/copyout() so the copyio recovery entry and
+	 * the user pmap fault path are used instead.
+	 */
+	user = (buf_flags(bp) & B_PHYS) != 0 &&
+	    !mido_kernel_address(vaddr);
+
+	for (uint32_t done = 0; done < count;) {
+		uint64_t pos = off + done;
+		uint64_t lba = pos / SDHCI_BLOCK;
+		uint32_t skip = (uint32_t)(pos % SDHCI_BLOCK);
+		uint32_t want = MIN(count - done, (uint32_t)BOUNCE_SIZE - skip);
+		uint32_t blocks = (skip + want + SDHCI_BLOCK - 1) / SDHCI_BLOCK;
+		char *bounce = (char *)(se.dma + DMA_BOUNCE);
+
+		if (rd) {
+			lck_mtx_lock(&mido_sdhci_lock);
+			error = mido_sdhci_read_blocks(se.first_block + lba,
+			    blocks, bounce);
+			lck_mtx_unlock(&mido_sdhci_lock);
+			if (!error) {
+				if (user) {
+					error = copyout(bounce + skip,
+					    (user_addr_t)(vaddr + done), want);
+				} else {
+					memcpy(vaddr + done, bounce + skip, want);
+				}
+			}
+		} else {
+			if (skip || (want % SDHCI_BLOCK)) {
+				lck_mtx_lock(&mido_sdhci_lock);
+				error = mido_sdhci_read_blocks(se.first_block + lba,
+				    blocks, bounce);
+				lck_mtx_unlock(&mido_sdhci_lock);
+				if (error) {
+					break;
+				}
+			}
+			if (user) {
+				error = copyin((user_addr_t)(vaddr + done),
+				    bounce + skip, want);
+			} else {
+				memcpy(bounce + skip, vaddr + done, want);
+			}
+			if (!error) {
+				lck_mtx_lock(&mido_sdhci_lock);
+				error = mido_sdhci_write_blocks(
+				    se.first_block + lba, blocks, bounce);
+				lck_mtx_unlock(&mido_sdhci_lock);
+			}
+		}
+		if (error) {
+			break;
+		}
+		done += want;
+		buf_setresid(bp, count - done);
+	}
+	buf_unmap(bp);
+
+done:
+	if (error) {
+		buf_seterror(bp, error);
+	}
+	buf_biodone(bp);
+}
+
+static int
+mido_sdhci_ioctl(__unused dev_t dev, u_long cmd, caddr_t data,
+    __unused int flag, __unused struct proc *p, int is_char)
+{
+	uint32_t *f = (uint32_t *)data;
+	uint64_t *o = (uint64_t *)data;
+
+	switch (cmd) {
+	case DKIOCGETBLOCKSIZE:
+		*f = se.secsize;
+		return 0;
+	case DKIOCSETBLOCKSIZE:
+		if (is_char) {
+			return ENODEV;
+		}
+		if (*f < DEV_BSIZE || *f > SDHCI_BLOCK || (*f & (*f - 1))) {
+			return EINVAL;
+		}
+		se.secsize = *f;
+		return 0;
+	case DKIOCGETPHYSICALBLOCKSIZE:
+		*f = SDHCI_BLOCK;
+		return 0;
+	case DKIOCGETBLOCKCOUNT:
+		*o = se.nblocks * SDHCI_BLOCK / se.secsize;
+		return 0;
+	case DKIOCISWRITABLE:
+		*f = se.writable ? 1 : 0;
+		return 0;
+	case DKIOCGETMAXBLOCKCOUNTREAD:
+		*o = BOUNCE_SIZE / se.secsize;
+		return 0;
+	case DKIOCGETMAXBLOCKCOUNTWRITE:
+		*o = se.writable ? BOUNCE_SIZE / se.secsize : 0;
+		return 0;
+	case DKIOCGETMAXSEGMENTCOUNTREAD:
+	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+		*o = 1;
+		return 0;
+	default:
+		return ENOTTY;
+	}
+}
+
+static int
+mido_sdhci_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag,
+    struct proc *p)
+{
+	return mido_sdhci_ioctl(dev, cmd, data, flag, p, 0);
+}
+
+static int
+mido_sdhci_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag,
+    struct proc *p)
+{
+	return mido_sdhci_ioctl(dev, cmd, data, flag, p, 1);
+}
+
+static int
+mido_sdhci_psize(__unused dev_t dev)
+{
+	return se.ready ?
+	       (int)MIN(se.nblocks * SDHCI_BLOCK / se.secsize, (uint64_t)INT_MAX) :
+	       -1;
+}
+
+/*
+ * Character-device transfers use a private kernel bounce buffer and
+ * uiomove(), never physio()/buf_map(). physio() only vslock()s the user
+ * range and passes the raw user VA to strategy(); a freshly wired anonymous
+ * page may still be mapped read-only with PP_ATTR_MODFAULT, and the first
+ * store into it from EL1 is a permission fault (ESR DFSC 0x0f). There is no
+ * copyio recovery entry for a plain kernel memcpy(), so handle_kernel_abort()
+ * resolves the address in kernel_map and panics. uiomove() uses copyin()/
+ * copyout(), which have a recovery entry and take the user pmap fault path.
+ *
+ * The controller bounce buffer (se.dma) is shared with strategy() and the log
+ * flusher, so allocate a bounce per call and never hold mido_sdhci_lock
+ * across uiomove(): a user fault can page in through the root filesystem and
+ * re-enter this driver.
+ */
+static int
+mido_sdhci_uio(struct uio *uio, bool rd)
+{
+	uint64_t part_bytes = se.nblocks * SDHCI_BLOCK;
+	vm_offset_t bounce = 0;
+	vm_size_t bsize;
+	int error = 0;
+
+	if (!se.ready) {
+		return ENXIO;
+	}
+	if (uio_resid(uio) <= 0) {
+		return 0;
+	}
+
+	bsize = (vm_size_t)MIN((uint64_t)uio_resid(uio) + SDHCI_BLOCK,
+	    (uint64_t)BOUNCE_SIZE);
+	bsize = roundup(bsize, SDHCI_BLOCK);
+	if (kmem_alloc(kernel_map, &bounce, bsize, KMA_DATA,
+	    VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
+		return ENOMEM;
+	}
+
+	while (uio_resid(uio) > 0) {
+		off_t uoff = uio_offset(uio);
+		uint64_t pos, left;
+		uint32_t skip, want, blocks;
+		char *buf = (char *)bounce;
+
+		if (uoff < 0 || (uint64_t)uoff >= part_bytes) {
+			break;                  /* EOF: short transfer */
+		}
+		pos = (uint64_t)uoff;
+		left = MIN((uint64_t)uio_resid(uio), part_bytes - pos);
+		skip = (uint32_t)(pos % SDHCI_BLOCK);
+		want = (uint32_t)MIN(left, (uint64_t)(BOUNCE_SIZE - skip));
+		blocks = (skip + want + SDHCI_BLOCK - 1) / SDHCI_BLOCK;
+
+		if (rd) {
+			lck_mtx_lock(&mido_sdhci_lock);
+			error = mido_sdhci_read_blocks(se.first_block +
+			    pos / SDHCI_BLOCK, blocks, buf);
+			lck_mtx_unlock(&mido_sdhci_lock);
+			if (error) {
+				break;
+			}
+			error = uiomove(buf + skip, (int)want, uio);
+		} else {
+			if (!se.writable) {
+				error = EROFS;
+				break;
+			}
+			if (skip || (want % SDHCI_BLOCK)) {
+				lck_mtx_lock(&mido_sdhci_lock);
+				error = mido_sdhci_read_blocks(se.first_block +
+				    pos / SDHCI_BLOCK, blocks, buf);
+				lck_mtx_unlock(&mido_sdhci_lock);
+				if (error) {
+					break;
+				}
+			}
+			error = uiomove(buf + skip, (int)want, uio);
+			if (error) {
+				break;
+			}
+			lck_mtx_lock(&mido_sdhci_lock);
+			error = mido_sdhci_write_blocks(se.first_block +
+			    pos / SDHCI_BLOCK, blocks, buf);
+			lck_mtx_unlock(&mido_sdhci_lock);
+		}
+		if (error) {
+			break;
+		}
+	}
+
+	kmem_free(kernel_map, bounce, bsize);
+	return error;
+}
+
+static int
+mido_sdhci_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	return mido_sdhci_uio(uio, true);
+}
+
+static int
+mido_sdhci_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	if (!se.writable) {
+		return EROFS;
+	}
+	return mido_sdhci_uio(uio, false);
+}
+
+static const struct bdevsw mido_sdhci_bdevsw = {
+	.d_open     = mido_sdhci_open,
+	.d_close    = mido_sdhci_close,
+	.d_strategy = mido_sdhci_strategy,
+	.d_ioctl    = mido_sdhci_bioctl,
+	.d_dump     = eno_dump,
+	.d_psize    = mido_sdhci_psize,
+	.d_type     = D_DISK,
+};
+
+static const struct cdevsw mido_sdhci_cdevsw = {
+	.d_open       = mido_sdhci_open,
+	.d_close      = mido_sdhci_close,
+	.d_read       = mido_sdhci_read,
+	.d_write      = mido_sdhci_write,
+	.d_ioctl      = mido_sdhci_cioctl,
+	.d_stop       = eno_stop,
+	.d_reset      = eno_reset,
+	.d_ttys       = NULL,
+	.d_select     = eno_select,
+	.d_mmap       = eno_mmap,
+	.d_strategy   = eno_strat,
+	.d_reserved_1 = eno_getc,
+	.d_reserved_2 = eno_putc,
+	.d_type       = D_DISK,
+};
+
+/*
+ * mido-only: the bare-metal shim does NOT enable SDCC1 (unlike santoni's LK),
+ * so the kernel must bring the block out of reset and turn on its bus/SDCLK
+ * branch clocks through the GCC before any SDHCI register is touched. With
+ * the AHB branch off, every read of the SDHCI window returns 0 - the exact
+ * "all registers zero" symptom seen in the diagnostic boot.
+ *
+ * GCC_SDCC1 block (MSM8953 == MSM8940 family, msm8937.dtsi): BCR at page base,
+ * AHB branch at +0x1c, APPS branch at +0x18. bit0 = CLK_ENABLE.
+ */
+static int
+mido_gcc_enable_clocks(void)
+{
+	uint32_t ahb, apps;
+
+	if (se.gcc == 0) {
+		printf("MIDO SDHCI: GCC page not mapped; cannot enable SDCC1\n");
+		return ENXIO;
+	}
+	/* Turn on the AHB branch (controller register bus clock) and the APPS
+	 * branch (SDCLK source). The register file reads real values only once
+	 * the AHB branch is enabled. */
+	gcc_wr(MIDO_GCC_SDCC1_AHB_CBCR, 1);
+	gcc_wr(GCC_SDCC1_APPS_CBCR, 1);
+	delay(10);
+
+	ahb = gcc_rd(MIDO_GCC_SDCC1_AHB_CBCR);
+	apps = gcc_rd(GCC_SDCC1_APPS_CBCR);
+	printf("MIDO SDHCI: GCC SDCC1 clocks: AHB 0x%08x APPS 0x%08x\n",
+	    ahb, apps);
+	if (!(ahb & 1u) || !(apps & 1u)) {
+		printf("MIDO SDHCI: GCC SDCC1 branch enable did not latch "
+		    "(AHB/APPS bit0)\n");
+		return ENXIO;
+	}
+	return 0;
+}
+
+mido_sdhci_init(void)
+{
+	DTEntry node;
+	uintptr_t const *reg = NULL;
+	unsigned int size = 0;
+	int error, rw = 0;
+
+	if (SecureDTLookupEntry(NULL, "/mido-sdhci", &node) != kSuccess ||
+	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+	    size < 2 * sizeof(uintptr_t)) {
+		printf("MIDO SDHCI: no /mido-sdhci node in the device tree\n");
+		return ENXIO;
+	}
+	if (reg[1] < 0x1000) {
+		printf("MIDO SDHCI: /mido-sdhci reg window too small "
+		    "(0x%llx)\n", (unsigned long long)reg[1]);
+		return ENXIO;
+	}
+	strlcpy(se.part, "userdata", sizeof(se.part));
+	PE_parse_boot_argn("emmcroot", se.part, sizeof(se.part));
+	if (PE_parse_boot_argn("emmcrw", &rw, sizeof(rw))) {
+		se.writable = (rw != 0);
+	}
+	se.secsize = DEV_BSIZE;
+
+	se.regs = ml_io_map(reg[0], reg[1]);
+	/*
+	 * Only the GCC page holding sdcc1_apps_clk_src is needed (CMD_RCGR
+	 * 0x42004 through CBCR 0x42018). Map it separately from the HC window;
+	 * both live in device memory and are accessed uncached.
+	 */
+	se.gcc = ml_io_map(GCC_SDCC1_APPS_PHYS, GCC_SDCC1_APPS_SIZE);
+	if (se.gcc == 0) {
+		printf("MIDO SDHCI: no mapping for GCC sdcc1_apps\n");
+		return ENXIO;
+	}
+	/* mido: the shim left SDCC1 unclocked; enable GCC SDCC1 now. */
+	if (mido_gcc_enable_clocks() != 0) {
+		return ENXIO;
+	}
+	if (kmem_alloc_contig(kernel_map, &se.dma, BOUNCE_SIZE, PAGE_MASK, 0, 0,
+	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) !=
+	    KERN_SUCCESS) {
+		printf("MIDO SDHCI: no contiguous bounce buffer\n");
+		return ENOMEM;
+	}
+	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)se.dma);
+	if (!pn) {
+		return ENOMEM;
+	}
+	se.dma_pa = ptoa_64(pn);
+
+	lck_mtx_lock(&mido_sdhci_lock);
+	error = sdhci_take_over();
+	if (!error) {
+		error = sdhci_verify_highspeed_bus(se.sec_count);
+	}
+	if (!error) {
+		error = mido_sdhci_find_partition(se.part);
+	}
+	lck_mtx_unlock(&mido_sdhci_lock);
+	if (error) {
+		return error;
+	}
+
+	se.bmajor = bdevsw_add(-1, &mido_sdhci_bdevsw);
+	if (se.bmajor < 0) {
+		return ENXIO;
+	}
+	se.cmajor = cdevsw_add_with_bdev(-1, &mido_sdhci_cdevsw, se.bmajor);
+	if (se.cmajor < 0) {
+		return ENXIO;
+	}
+	se.bdev = makedev(se.bmajor, 0);
+	devfs_make_node(se.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
+	    "emmcroot0");
+	devfs_make_node(makedev(se.cmajor, 0), DEVFS_CHAR, UID_ROOT,
+	    GID_OPERATOR, 0640, "remmcroot0");
+	se.ready = true;
+	if (se.sys_nblocks) {
+		printf("MIDO SDHCI: \"system\" first block 0x%llx, %llu MiB%s\n",
+		    (unsigned long long)se.sys_first_block,
+		    (unsigned long long)(se.sys_nblocks * SDHCI_BLOCK >> 20),
+		    se.sys_nblocks >= MIDO_LOG_SYSTEM_BLOCKS ?
+		    " (console log area available)" :
+		    " (too small for the console log)");
+	}
+	printf("MIDO SDHCI: \"%s\" first block 0x%llx, %llu MiB, %s\n",
+	    se.part, (unsigned long long)se.first_block,
+	    (unsigned long long)(se.nblocks * SDHCI_BLOCK >> 20),
+	    se.writable ? "writable (emmcrw=1)" : "read-only");
+	return 0;
+}
+
+/*
+ * Idempotent, non-fatal probe. IOKitBSDInit calls this on every boot before
+ * IOFindBSDRoot: a missing or unhappy eMMC must not panic a RAM-disk boot.
+ * The first attempt is remembered, so rd=emmcroot0 cannot initialise twice.
+ */
+static bool attempted;
+static int init_error;
+
+int mido_sdhci_probe(void);
+
+int
+mido_sdhci_probe(void)
+{
+	if (!attempted) {
+		attempted = true;
+		init_error = mido_sdhci_init();
+	}
+	return init_error;
+}
+
+/* Root device for rd=emmcroot0 (IOFindBSDRoot). */
+int mido_sdhci_rootdev(dev_t *dev);
+
+int
+mido_sdhci_rootdev(dev_t *dev)
+{
+	int error = mido_sdhci_probe();
+
+	if (error) {
+		return error;
+	}
+	if (!se.ready) {
+		return ENXIO;
+	}
+	*dev = se.bdev;
+	return 0;
+}
+
 #endif /* ARM64_BOARD_CONFIG_SWEET */
