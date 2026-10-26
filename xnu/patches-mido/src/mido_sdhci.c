@@ -20,18 +20,31 @@
  * Modeled on bsd/dev/sweet_ufs.c (the working UFS root in this tree) for the
  * XNU KPI: ml_io_map, SecureDTLookupEntry/SecureDTGetProperty, printf, the
  * bdevsw/cdevsw + devfs + IOFindBSDRoot registration shape.
+ *
+ * The target GPT partition comes from the "emmcroot=" boot-arg, default
+ * "userdata" (project decision: the iOS rootfs lives on userdata).
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/buf.h>
 #include <sys/conf.h>
 #include <sys/disk.h>
-#include <sys/buf.h>
+#include <sys/errno.h>
+#include <sys/proc.h>
+#include <sys/uio.h>
 #include <sys/dev.h>
+#include <miscfs/devfs/devfs.h>
+#include <kern/locks.h>
+#include <kern/clock.h>
+#include <machine/machine_routines.h>
+#include <arm/caches_internal.h>
+#include <vm/pmap.h>
+#include <vm/vm_kern.h>
+#include <mach/vm_types.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
 #include <libkern/libkern.h>
-#include <machine/machine_routines.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
@@ -78,11 +91,13 @@ mido_sdhci_map(void)
 	}
 	vm_offset_t va = ml_io_map((vm_offset_t)base, (vm_size_t)winsz);
 	if (!va) {
-		printf("MIDO SDHCI: ml_io_map(0x%llx, 0x%llx) failed\n", base, winsz);
+		printf("MIDO SDHCI: ml_io_map(0x%llx, 0x%llx) failed\n",
+		    (unsigned long long)base, (unsigned long long)winsz);
 		return ENOMEM;
 	}
 	g_core = (volatile uint32_t *)va;
-	printf("MIDO SDHCI: core window mapped va=%p phys=0x%llx\n", g_core, base);
+	printf("MIDO SDHCI: core window mapped va=%p phys=0x%llx\n",
+	    g_core, (unsigned long long)base);
 	return 0;
 }
 
@@ -116,19 +131,23 @@ mido_sdhci_diag(void)
 	printf("    spec_ver=0x%x baseclk=%uMHz adma2=%u v3_64=%u\n",
 	    capa0 & 0xffu, (capa0 >> 8) & 0xffu, (capa0 >> 19) & 1u,
 	    (capa0 >> 27) & 1u);
-	printf("    max_block_len_log2=0x%x (=%u bytes)\n",
-	    (capa0 >> 16) & 0x3u, 1u << ((capa0 >> 16) & 0x3u) << 10);
+	printf("    max_block_len_log2=0x%x\n", (capa0 >> 16) & 0x3u);
 }
 
 /*
- * IOFindBSDRoot hook target for rd=emmcroot0. Diagnostic only: dump and
- * refuse to mount so the boot stalls after the dump (no panic) while we
- * learn the host state. The next milestone returns 0 here and fills *dev.
+ * IOFindBSDRoot hook target for rd=emmcroot0. Diagnostic only: report the
+ * target GPT partition (emmcroot= boot-arg, default "userdata"), dump the
+ * host, and refuse to mount (ENXIO) so the boot prints the host state but
+ * stalls. The next milestone returns 0 here and fills *dev.
  */
 int
 mido_emmc_rootdev(dev_t *dev)
 {
+	char want[64] = "userdata";
+
 	(void)dev;
+	PE_parse_boot_argn("emmcroot", want, sizeof(want));
+	printf("MIDO SDHCI: emmcroot boot-arg = \"%s\" (target GPT partition)\n", want);
 	mido_sdhci_diag();
 	printf("MIDO SDHCI: diagnostic only; root-on-eMMC not yet implemented\n");
 	return ENXIO;
