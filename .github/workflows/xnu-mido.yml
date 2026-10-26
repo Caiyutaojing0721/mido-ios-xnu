@@ -232,6 +232,15 @@ jobs:
           # as the write looks complete, so a power cut in that window leaves
           # an empty journal over blocks that never reached flash.
           cp xnu/patches-mido/0122-*.patch dxb/patches/ 2>/dev/null || true
+          # 0123: map the dyld shared cache without a slide.  dyld asks the
+          # kernel to relocate every VM_PROT_SLIDE page while installing the
+          # cache; on a 4 KiB-page kernel that rebase produced a cache whose
+          # __DATA was subtly wrong (dyld4 aborted on a corrupt
+          # PrebuiltLoaderSet with "file does not start with MH_MAGIC_64:
+          # 0x696C7062 0x30307473", i.e. "bplist00"), and the cache was also
+          # never found by check_np.  Map at the nominal addresses instead and
+          # let dyld derive a slide of zero.  srslide=1 restores the old path.
+          cp xnu/patches-mido/0123-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch

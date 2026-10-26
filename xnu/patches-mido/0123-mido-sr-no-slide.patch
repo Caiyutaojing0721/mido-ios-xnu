@@ -1,0 +1,106 @@
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -53,6 +53,7 @@
+ #include <mach/vm_map.h>
+ #include <mach/vm_param.h>
+ #include <mach/vm_prot.h>
++#include <pexpert/pexpert.h>
+ #include <machine/machine_routines.h>
+ 
+ #include <sys/file_internal.h>
+@@ -2152,11 +2153,16 @@
+ 		error = EINVAL;
+ 	}
+ 
+-	SHARED_REGION_TRACE_DEBUG(
+-		("shared_region: %p [%d(%s)] check_np(0x%llx) <- 0x%llx %d\n",
+-		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+-		proc_getpid(p), p->p_comm,
+-		(uint64_t)uap->start_address, (uint64_t)start_address, error));
++	if (error == 0) {
++		printf("MIDO SR: %s check_np -> 0x%llx\n",
++		    p->p_comm, (uint64_t)start_address);
++	} else {
++		SHARED_REGION_TRACE_DEBUG(
++			("shared_region: %p [%d(%s)] check_np(0x%llx) <- 0x%llx %d\n",
++			(void *)VM_KERNEL_ADDRPERM(current_thread()),
++			proc_getpid(p), p->p_comm,
++			(uint64_t)uap->start_address, (uint64_t)start_address, error));
++	}
+ 
+ 	return error;
+ }
+@@ -2199,6 +2205,27 @@
+ 	struct vm_shared_region  *shared_region);
+ 
+ /*
++ * mido: do we let dyld slide the shared cache?
++ *
++ * Default is no.  See the long comment in shared_region_map_and_slide_setup().
++ * Boot with srslide=1 to restore dyld's slide.
++ */
++static int mido_sr_slide_forced = -1;
++static int mido_sr_slide_reported = 0;
++
++static int
++mido_sr_slide(void)
++{
++	if (mido_sr_slide_forced < 0) {
++		int keep = 0;
++
++		PE_parse_boot_argn("srslide", &keep, sizeof(keep));
++		mido_sr_slide_forced = keep ? 1 : 0;
++	}
++	return mido_sr_slide_forced;
++}
++
++/*
+  * Setup part of _shared_region_map_and_slide().
+  * It had to be broken out of _shared_region_map_and_slide() to
+  * prevent compiler inlining from blowing out the stack.
+@@ -2258,6 +2285,45 @@
+ 			goto done;
+ 		}
+ 		srfmp->slide = files[i].sf_slide;
++
++		/*
++		 * mido: install the dyld shared cache without a slide.
++		 *
++		 * dyld picks a random slide and asks us to relocate every
++		 * VM_PROT_SLIDE page while the mapping is installed.  That
++		 * relocation depends on the cache's slide info granularity
++		 * matching PAGE_SIZE_FOR_SR_SLIDE and on the rebase chain layout
++		 * matching this kernel exactly.  On this port the result is a
++		 * shared cache whose __DATA is subtly inconsistent: dyld4 reads a
++		 * corrupt PrebuiltLoaderSet and aborts the process with
++		 *
++		 *   file does not start with MH_MAGIC_64: 0x696C7062 0x30307473
++		 *
++		 * (those eight bytes are the ASCII string "bplist00"), while other
++		 * daemons take SIGSEGV inside ObjC/CF metadata.
++		 *
++		 * Installing the mappings at their nominal addresses and leaving
++		 * the slide info alone removes the relocation step entirely: the
++		 * cache stays byte for byte the image dyld built, and dyld derives
++		 * a slide of zero from _shared_region_check_np().  The price is
++		 * that the shared cache is no longer randomised, which means
++		 * nothing on a port that has no ASLR guarantees anyway.
++		 */
++		if (mido_sr_slide() == 0 && srfmp->slide != 0) {
++			uint32_t midx;
++
++			if (!mido_sr_slide_reported) {
++				mido_sr_slide_reported = 1;
++				printf("MIDO SR: ignoring dyld slide 0x%x, "
++				    "mapping the shared cache unslid\n",
++				    srfmp->slide);
++			}
++			srfmp->slide = 0;
++			for (midx = 0; midx < srfmp->mappings_count; midx++) {
++				srfmp->mappings[midx].sms_max_prot &=
++				    ~VM_PROT_SLIDE;
++			}
++		}
+ 	}
+ 
+ 	/* get the process's shared region (setup in vm_map_exec()) */
