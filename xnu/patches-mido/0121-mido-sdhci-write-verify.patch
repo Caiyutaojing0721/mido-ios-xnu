@@ -1,0 +1,112 @@
+--- a/bsd/dev/mido_sdhci.c
++++ b/bsd/dev/mido_sdhci.c
+@@ -336,6 +336,8 @@
+ 	bool writable;                          /* boot-arg emmcrw=1 */
+ 	bool cache_ok;                          /* FLUSH_CACHE is supported */
+ 	bool writes_pending;                    /* data written since last flush */
++	bool verify_writes;                     /* boot-arg sdhciverify (default on) */
++	uint32_t verify_fails;                  /* blocks whose read-back differed */
+ 	uint32_t cache_size;                    /* EXT_CSD CACHE_SIZE, 256 KiB units */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+@@ -2142,6 +2144,67 @@
+ 	return EIO;
+ }
+ 
++/*
++ * Read a write back and compare it with what we sent. This separates the two
++ * ways a filesystem can end up corrupted on this board:
++ *
++ *   - no mismatch: the PIO transfer, the LBA arithmetic and the card's own
++ *     write path all did what they were told, so a damaged B-tree came from
++ *     data that never reached flash (power cut in flight) and has to be
++ *     explained by the journal, not by the driver;
++ *   - mismatch: the driver or the card silently altered the block, and the
++ *     lba printed here is the first evidence of exactly where.
++ *
++ * The card's write cache, when enabled, returns what it holds, so this can
++ * only catch transport errors - not loss after acknowledgement. That is what
++ * DKIOCSYNCHRONIZECACHE/FLUSH_CACHE (0119) is for.
++ *
++ * Runs under mido_sdhci_lock, which the caller already holds, so the 4 KiB
++ * staging buffer cannot be shared with another request.
++ */
++static uint8_t mido_verify_buf[SDHCI_BLOCK * 8];
++
++static void
++sdhci_verify_write(uint32_t lba, uint32_t count, const void *buf)
++{
++	const uint8_t *src = (const uint8_t *)buf;
++
++	for (uint32_t i = 0; i < count; i += 8) {
++		uint32_t n = MIN(count - i, 8u);
++
++		if (sdhci_read_pio(n == 1 ? 17 : 18, lba + i, n,
++		    mido_verify_buf)) {
++			printf("MIDO SDHCI: write verify could not read back "
++			    "lba 0x%x x%u\n", lba + i, n);
++			return;
++		}
++		for (uint32_t b = 0; b < n; b++) {
++			const uint8_t *w = src + (size_t)(i + b) * SDHCI_BLOCK;
++			const uint8_t *r = mido_verify_buf +
++			    (size_t)b * SDHCI_BLOCK;
++			uint32_t off = 0;
++
++			if (!memcmp(w, r, SDHCI_BLOCK)) {
++				continue;
++			}
++			se.verify_fails++;
++			if (se.verify_fails > 8) {
++				continue;
++			}
++			while (off + 4 < SDHCI_BLOCK && w[off] == r[off]) {
++				off++;
++			}
++			printf("MIDO SDHCI: WRITE VERIFY MISMATCH lba 0x%x "
++			    "byte %u: wrote %02x %02x %02x %02x, read back "
++			    "%02x %02x %02x %02x (fail #%u)\n",
++			    lba + i + b, off,
++			    w[off], w[off + 1], w[off + 2], w[off + 3],
++			    r[off], r[off + 1], r[off + 2], r[off + 3],
++			    se.verify_fails);
++		}
++	}
++}
++
+ static int
+ mido_sdhci_read_blocks(uint64_t lba, uint32_t count, void *buf)
+ {
+@@ -2183,6 +2246,9 @@
+ 	error = sdhci_write_pio((uint32_t)lba, count, buf);
+ 	if (!error) {
+ 		se.writes_pending = true;
++		if (se.verify_writes) {
++			sdhci_verify_write((uint32_t)lba, count, buf);
++		}
+ 	}
+ 	return error;
+ 
+@@ -2543,6 +2609,10 @@
+ 
+ done:
+ 	if (error) {
++		printf("MIDO SDHCI: %s of %u sectors at lba 0x%llx failed, "
++		    "errno %d\n", rd ? "read" : "write", count,
++		    (unsigned long long)(se.first_block +
++		    off / SDHCI_BLOCK), error);
+ 		buf_seterror(bp, error);
+ 	}
+ 	buf_biodone(bp);
+@@ -2835,6 +2905,11 @@
+ 	if (PE_parse_boot_argn("emmcrw", &rw, sizeof(rw))) {
+ 		se.writable = (rw != 0);
+ 	}
++	/* Read every filesystem write back; sdhciverify=0 turns it off. */
++	se.verify_writes = true;
++	if (PE_parse_boot_argn("sdhciverify", &rw, sizeof(rw))) {
++		se.verify_writes = (rw != 0);
++	}
+ 	se.secsize = DEV_BSIZE;
+ 
+ 	se.regs = ml_io_map(reg[0], reg[1]);

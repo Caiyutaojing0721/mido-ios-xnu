@@ -219,6 +219,12 @@ jobs:
           # holding each page for 1.8 s, then park on the last page.  Both
           # triggers are off unless set in boot-args.
           cp xnu/patches-mido/0120-*.patch dxb/patches/ 2>/dev/null || true
+          # 0121: read every filesystem write back and print the first byte
+          # that differs.  A damaged catalog B-tree can mean either "the
+          # driver wrote the wrong bytes" or "the bytes never reached flash";
+          # this tells the two apart in the next boot log, and reports the
+          # failing lba instead of leaving the strategy path silent.
+          cp xnu/patches-mido/0121-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch
