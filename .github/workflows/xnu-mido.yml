@@ -199,6 +199,16 @@ jobs:
           # waived (one 4 KiB page cannot reproduce a 16 KiB hash), everything
           # else in the blob is still validated.
           cp xnu/patches-mido/0118-*.patch dxb/patches/ 2>/dev/null || true
+          # 0119: make the eMMC write path durable.  HFS+ asks for
+          # DKIOCSYNCHRONIZECACHE after every journal commit and the driver
+          # answered ENOTTY ("jnl: b(1,0): flushing fs disk buffer returned
+          # 0x19"), so a journal commit was durable only in the card's write
+          # cache; pulling power then replayed a journal over blocks that had
+          # never reached flash and left a torn B-tree node
+          # ("hfs_swap_BTNode: offset #0 invalid").  Implement the ioctl with
+          # eMMC FLUSH_CACHE (CMD6 write-byte EXT_CSD[32] bit 0) and only when
+          # something was written since the previous flush.
+          cp xnu/patches-mido/0119-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch

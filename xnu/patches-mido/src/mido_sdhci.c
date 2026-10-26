@@ -289,6 +289,19 @@ static const struct mido_gcc_rate mido_gcc_rates[] = {
 #define EXT_CSD_HS_TIMING       185u
 #define EXT_CSD_TIMING_HS       1u
 
+/*
+ * eMMC write cache (JESD84-B51 6.6.14). The card acknowledges a write as soon
+ * as the data is in its cache, so a power cut between the acknowledgement and
+ * the cache flush loses or tears the last blocks. HFS+ relies on
+ * DKIOCSYNCHRONIZECACHE to close that window; without it a 4 KiB B-tree node
+ * can land half written and the next mount reads a node whose offset table is
+ * garbage ("hfs_swap_BTNode: offset #0 invalid").
+ */
+#define EXT_CSD_CACHE_CTRL      32u
+#define EXT_CSD_CACHE_FLUSH     0x01u
+#define EXT_CSD_CACHE_SIZE      249u    /* [252:249], 256 KiB units */
+#define CACHE_FLUSH_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+
 /* --------------------------------------------------------------- transfers */
 #define SDHCI_BLOCK             512u
 #define BOUNCE_SIZE             (1u << 20)
@@ -321,6 +334,9 @@ static struct {
 	bool enumerated;                        /* card is 25 MHz, 8-bit, HS */
 	bool log_ok;                            /* SYSTEM log area is safe */
 	bool writable;                          /* boot-arg emmcrw=1 */
+	bool cache_ok;                          /* FLUSH_CACHE is supported */
+	bool writes_pending;                    /* data written since last flush */
+	uint32_t cache_size;                    /* EXT_CSD CACHE_SIZE, 256 KiB units */
 	int bmajor, cmajor;
 	dev_t bdev;
 	bool ready;
@@ -1624,6 +1640,70 @@ sdhci_wait_card_ready(uint32_t rca, const char *what)
 }
 
 /*
+ * eMMC FLUSH_CACHE: CMD6 write-byte EXT_CSD[32] (CACHE_CTRL) bit 0.
+ *
+ * This is what DKIOCSYNCHRONIZECACHE is for. Everything this driver writes is
+ * acknowledged once the SDHCI block transfer completes, i.e. once the data
+ * sits in the card's write cache -- not necessarily in flash. HFS+ journals
+ * every metadata transaction and then asks the device to make it durable; if
+ * that request fails (it used to return ENOTTY, printed by hfs as
+ * "jnl: b(1,0): flushing fs disk buffer returned 0x19") the journal can be
+ * replayed from blocks that never reached the medium, which is exactly the
+ * torn B-tree node the mido log showed.
+ *
+ * CMD6 with R1b holds DAT0 low while the cache is written out, so poll
+ * PRESENT_STATE for the busy release instead of issuing CMD13 into it.
+ * A card with CACHE_SIZE == 0 has no cache and needs no flush; one that
+ * rejects the command (SWITCH_ERROR) is latched off and only warns once.
+ */
+static int
+sdhci_flush_cache(void)
+{
+	uint32_t arg, r1 = 0, st;
+	uint64_t deadline;
+	int error;
+
+	if (!se.ready || !se.enumerated || !se.cache_ok) {
+		return 0;
+	}
+
+	arg = (EXT_CSD_WRITE_BYTE << 24) | (EXT_CSD_CACHE_CTRL << 16) |
+	    (EXT_CSD_CACHE_FLUSH << 8) | EXT_CSD_CMD_SET_NORMAL;
+	error = sdhci_cmd(6, arg, 0,
+	    SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, &r1);
+	if (error || (r1 & SDHCI_R1_SWITCH_ERROR)) {
+		se.cache_ok = false;
+		printf("MIDO SDHCI: FLUSH_CACHE refused (error %d, R1 "
+		    "0x%08x); write cache disabled in the card, nothing to "
+		    "flush\n", error, r1);
+		if (error) {
+			sdhci_recover();
+		}
+		return 0;
+	}
+
+	nanoseconds_to_absolutetime(CACHE_FLUSH_TIMEOUT_NS, &deadline);
+	deadline += mach_absolute_time();
+	delay(1000);
+	for (;;) {
+		st = hc_rd(SDHCI_PRESENT_STATE);
+		if (!(st & (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT)) &&
+		    (st & SDHCI_DATA_0_LVL_MASK)) {
+			break;
+		}
+		if (mach_absolute_time() > deadline) {
+			printf("MIDO SDHCI: FLUSH_CACHE did not complete "
+			    "within 5 s (PRESENT_STATE 0x%08x)\n", st);
+			return ETIMEDOUT;
+		}
+		delay(1000);
+	}
+
+	se.writes_pending = false;
+	return 0;
+}
+
+/*
  * CMD6 SWITCH write-byte. The host bus/timing change is applied immediately
  * after the response, before the busy phase ends: the card has already been
  * told the new mode, and the next CMD13/data phase must use it. ctrl_clear is
@@ -1774,6 +1854,24 @@ sdhci_enumerate_card(void)
 	printf("MIDO SDHCI: enumeration: EXT_CSD SEC_COUNT %u "
 	    "(%llu MiB)\n", sec_count,
 	    (unsigned long long)((uint64_t)sec_count * SDHCI_BLOCK >> 20));
+	{
+		const uint8_t *ext = (const uint8_t *)(se.dma + DMA_BOUNCE);
+
+		se.cache_size = (uint32_t)ext[EXT_CSD_CACHE_SIZE] |
+		    ((uint32_t)ext[EXT_CSD_CACHE_SIZE + 1] << 8) |
+		    ((uint32_t)ext[EXT_CSD_CACHE_SIZE + 2] << 16) |
+		    ((uint32_t)ext[EXT_CSD_CACHE_SIZE + 3] << 24);
+		se.cache_ok = se.cache_size != 0;
+		printf("MIDO SDHCI: EXT_CSD CACHE_SIZE %u (%llu KiB) "
+		    "CACHE_CTRL 0x%02x WR_REL_SET 0x%02x\n",
+		    se.cache_size,
+		    (unsigned long long)se.cache_size * 256ull, ext[32],
+		    ext[167]);
+		if (!se.cache_ok) {
+			printf("MIDO SDHCI: no write cache: every write is "
+			    "durable when the block transfer completes\n");
+		}
+	}
 
 	printf("MIDO SDHCI: enumeration: switch GCC to 25 MHz\n");
 	error = sdhci_gcc_set_apps(&mido_gcc_rates[MIDO_GCC_RATE_25M]);
@@ -2063,6 +2161,7 @@ static int
 mido_sdhci_write_blocks(uint64_t lba, uint32_t count, const void *buf)
 {
 	uint64_t off;
+	int error;
 
 	if (!se.writable) {
 		return EROFS;
@@ -2081,7 +2180,11 @@ mido_sdhci_write_blocks(uint64_t lba, uint32_t count, const void *buf)
 		    se.sec_count);
 		return EINVAL;
 	}
-	return sdhci_write_pio((uint32_t)lba, count, buf);
+	error = sdhci_write_pio((uint32_t)lba, count, buf);
+	if (!error) {
+		se.writes_pending = true;
+	}
+	return error;
 
 refuse:
 	printf("MIDO SDHCI: refusing write of %u blocks at 0x%llx "
@@ -2310,6 +2413,9 @@ mido_sdhci_write_log_blocks(uint64_t lba, uint32_t count, const void *buf)
 	 */
 	lck_mtx_lock(&mido_sdhci_lock);
 	error = sdhci_write_pio((uint32_t)lba, count, buf);
+	if (!error) {
+		se.writes_pending = true;
+	}
 	lck_mtx_unlock(&mido_sdhci_lock);
 	return error;
 }
@@ -2481,6 +2587,30 @@ mido_sdhci_ioctl(__unused dev_t dev, u_long cmd, caddr_t data,
 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
 		*o = 1;
 		return 0;
+	/*
+	 * HFS+ asks for this after every journal commit ("jnl: b(1,0):
+	 * flushing fs disk buffer"). It used to fall through to ENOTTY, so
+	 * the journal believed data was durable while it was still in the
+	 * card's write cache -- and a power cut then replayed a journal over
+	 * blocks that had never landed.
+	 */
+#ifdef DKIOCSYNCHRONIZECACHE
+	case DKIOCSYNCHRONIZECACHE:
+#endif
+#ifdef DKIOCFLUSHWRITECACHE
+	case DKIOCFLUSHWRITECACHE:
+#endif
+	{
+		int error;
+
+		if (!se.writes_pending) {
+			return 0;
+		}
+		lck_mtx_lock(&mido_sdhci_lock);
+		error = sdhci_flush_cache();
+		lck_mtx_unlock(&mido_sdhci_lock);
+		return error;
+	}
 	default:
 		return ENOTTY;
 	}
