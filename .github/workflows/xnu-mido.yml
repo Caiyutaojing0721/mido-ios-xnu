@@ -185,6 +185,11 @@ jobs:
           # enable) and sweet_gicv2_sgi_probe() prints the per-core
           # group/priority/PMR the controller will actually decide with.
           cp xnu/patches-mido/0116-*.patch dxb/patches/ 2>/dev/null || true
+          # 0117: mido eMMC SDHCI diagnostic root-device hook (rd=emmcroot0).
+          # Take over the SDHCI host ABL left running, dump present/cap/clock/
+          # power so the serial console shows the host state, then refuse to
+          # mount (ENXIO, non-panicking) until the real block-I/O milestone.
+          cp xnu/patches-mido/0117-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch
