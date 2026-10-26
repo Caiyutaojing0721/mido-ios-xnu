@@ -1,0 +1,46 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index a40c573..bf38984 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -229,18 +229,31 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	__builtin_arm_dsb(DSB_ISHST);
+ 	if (sweet_gicv2) {
+ 		/*
+-		 * GIC-400 has no ICC_SGI1R_EL1. The distributor's SGIR takes a target
+-		 * list; this driver only ever signals itself (see initCPU), so use the
+-		 * "self" filter rather than inventing a CPU numbering.
++		 * GIC-400 has no ICC_SGI1R_EL1: GICD_SGIR (GICD+0xF00) instead takes
++		 * TargetListFilter[25:24], CPUTargetList[23:16] and SGIINTID[3:0]
++		 * (same encoding QEMU decodes for GICv2 and Linux writes as
++		 * `map << 16 | irq`).
++		 *
++		 * initCPU() only ever signals itself, so 0110 could hard-code filter
++		 * 0b10 ("requesting PE only").  Once more than one CPU is running,
++		 * XNU sends targeted IPIs (AST, TLB shootdown) and the panic in that
++		 * version would fire on the first one.  Cluster 0 core N is CPU
++		 * interface N, which is the bit GICD_ITARGETSR uses for SPIs too.
+ 		 */
+-		uint64_t const self = __builtin_arm_rsr64("MPIDR_EL1") &
+-		    (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
+-		if ((mpidr & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK)) != self) {
+-			panic("SWEET CPU: GIC-400 cross-CPU SGI is not wired up yet (cpu %u)",
+-			    logical);
++		uint32_t const mask = (uint32_t)(MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
++		uint32_t const self = (uint32_t)__builtin_arm_rsr64("MPIDR_EL1") & mask;
++		uint32_t const target_pe = (uint32_t)mpidr & mask;
++		uint32_t sgir;
++		if (target_pe == self) {
++			sgir = (2U << 24) | SWEET_IPI_SGI; /* filter 0b10: this PE */
++		} else if (target_pe < 8) {
++			sgir = (1U << (16 + target_pe)) | SWEET_IPI_SGI;
++		} else {
++			panic("SWEET CPU: no GIC-400 CPU interface for mpidr 0x%x "
++			    "(cluster 1 mapping is still unknown)", target_pe);
+ 		}
+-		*(volatile uint32_t *)(sweet_gicd_base + 0x0F00) =   /* GICD_SGIR */
+-		    (2U << 24) | SWEET_IPI_SGI;
++		__builtin_arm_dsb(DSB_ISHST);
++		*(volatile uint32_t *)(sweet_gicd_base + 0x0F00) = sgir;
+ 	} else {
+ 		__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+ 	}

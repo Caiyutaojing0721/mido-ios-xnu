@@ -158,6 +158,13 @@ jobs:
           # MPIDR & 0xffff, ml_processor_register() with the logical id), so the
           # check now accepts cluster 0 up to four cores and says so explicitly.
           cp xnu/patches-mido/0113-*.patch dxb/patches/ 2>/dev/null || true
+          # 0114-* gives the GIC-400 path real cross-CPU SGIs.  0110 could only
+          # signal the requesting PE, which is all initCPU() needs for its
+          # self-test -- but the moment a second CPU is running, XNU sends
+          # targeted IPIs (AST, TLB shootdown) and 0110's panic would fire.
+          # GICD_SGIR is CPUTargetList[23:16] | SGIINTID[3:0] |
+          # TargetListFilter[25:24]; cluster 0 core N is CPU interface N.
+          cp xnu/patches-mido/0114-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch
