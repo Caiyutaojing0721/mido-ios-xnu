@@ -315,6 +315,7 @@ static const struct mido_gcc_rate mido_gcc_rates[] = {
 #define CMD_TIMEOUT_NS          (100ull * NSEC_PER_MSEC)
 #define DATA_TIMEOUT_NS         (2ull * NSEC_PER_SEC)
 #define CMD6_BUSY_TIMEOUT_NS    (1ull * NSEC_PER_SEC)
+#define WRITE_PROGRAM_TIMEOUT_NS (2ull * NSEC_PER_SEC)
 
 static struct {
 	vm_offset_t regs;                       /* core base, HC at +0x900 */
@@ -335,6 +336,7 @@ static struct {
 	bool log_ok;                            /* SYSTEM log area is safe */
 	bool writable;                          /* boot-arg emmcrw=1 */
 	bool cache_ok;                          /* FLUSH_CACHE is supported */
+	bool cache_enabled;                     /* EXT_CSD CACHE_CTRL bit 0 */
 	bool writes_pending;                    /* data written since last flush */
 	bool verify_writes;                     /* boot-arg sdhciverify (default on) */
 	uint32_t verify_fails;                  /* blocks whose read-back differed */
@@ -346,6 +348,14 @@ static struct {
 
 static LCK_GRP_DECLARE(mido_sdhci_grp, "mido_sdhci");
 static LCK_MTX_DECLARE(mido_sdhci_lock, &mido_sdhci_grp);
+
+/*
+ * Set while the write-programming poll issues CMD13 every millisecond: a card
+ * that is still programming legitimately answers without READY_FOR_DATA, and
+ * the per-command diagnostics in sdhci_cmd() would otherwise fill the console
+ * with twenty lines per write.
+ */
+static bool sdhci_quiet;
 
 static inline uint32_t
 hc_rd(uint32_t off)
@@ -471,9 +481,12 @@ sdhci_cmd(uint8_t index, uint32_t arg, uint16_t tr_mode, uint16_t flags,
 	error = sdhci_poll_state(SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT,
 	    CMD_TIMEOUT_NS);
 	if (error) {
-		printf("MIDO SDHCI: command %u blocked (arg 0x%08x, "
-		    "INT_STATUS 0x%08x, PRESENT_STATE 0x%08x)\n", index, arg,
-		    hc_rd(SDHCI_INT_STATUS), hc_rd(SDHCI_PRESENT_STATE));
+		if (!sdhci_quiet) {
+			printf("MIDO SDHCI: command %u blocked (arg 0x%08x, "
+			    "INT_STATUS 0x%08x, PRESENT_STATE 0x%08x)\n",
+			    index, arg, hc_rd(SDHCI_INT_STATUS),
+			    hc_rd(SDHCI_PRESENT_STATE));
+		}
 		return EBUSY;
 	}
 
@@ -491,15 +504,21 @@ sdhci_cmd(uint8_t index, uint32_t arg, uint16_t tr_mode, uint16_t flags,
 		if (st & SDHCI_INT_ERR) {
 			sdhci_cmd_stamp(start);
 			hc_wr(SDHCI_INT_STATUS, st);
-			printf("MIDO SDHCI: command %u failed (arg 0x%08x, "
-			    "INT_STATUS 0x%08x%s%s%s%s, PRESENT_STATE "
-			    "0x%08x, %llu ns)\n", index, arg, st,
-			    (st & SDHCI_INT_CMD_TIMEOUT) ? " cmd-timeout" : "",
-			    (st & SDHCI_INT_CMD_CRC) ? " cmd-crc" : "",
-			    (st & SDHCI_INT_CMD_END_BIT) ? " cmd-end-bit" : "",
-			    (st & SDHCI_INT_CMD_INDEX) ? " cmd-index" : "",
-			    hc_rd(SDHCI_PRESENT_STATE),
-			    (unsigned long long)se.last_cmd_ns);
+			if (!sdhci_quiet) {
+				printf("MIDO SDHCI: command %u failed (arg "
+				    "0x%08x, INT_STATUS 0x%08x%s%s%s%s, "
+				    "PRESENT_STATE 0x%08x, %llu ns)\n",
+				    index, arg, st,
+				    (st & SDHCI_INT_CMD_TIMEOUT) ?
+				    " cmd-timeout" : "",
+				    (st & SDHCI_INT_CMD_CRC) ? " cmd-crc" : "",
+				    (st & SDHCI_INT_CMD_END_BIT) ?
+				    " cmd-end-bit" : "",
+				    (st & SDHCI_INT_CMD_INDEX) ?
+				    " cmd-index" : "",
+				    hc_rd(SDHCI_PRESENT_STATE),
+				    (unsigned long long)se.last_cmd_ns);
+			}
 			return EIO;
 		}
 		if (st & SDHCI_INT_CC) {
@@ -512,12 +531,16 @@ sdhci_cmd(uint8_t index, uint32_t arg, uint16_t tr_mode, uint16_t flags,
 		}
 		if (mach_absolute_time() > deadline) {
 			sdhci_cmd_stamp(start);
-			printf("MIDO SDHCI: command %u timed out (arg "
-			    "0x%08x, INT_STATUS 0x%08x, PRESENT_STATE 0x%08x, "
-			    "CMD_INHIBIT %u, %llu ns)\n", index, arg, st,
-			    hc_rd(SDHCI_PRESENT_STATE),
-			    hc_rd(SDHCI_PRESENT_STATE) & SDHCI_CMD_INHIBIT,
-			    (unsigned long long)se.last_cmd_ns);
+			if (!sdhci_quiet) {
+				printf("MIDO SDHCI: command %u timed out (arg "
+				    "0x%08x, INT_STATUS 0x%08x, PRESENT_STATE "
+				    "0x%08x, CMD_INHIBIT %u, %llu ns)\n",
+				    index, arg, st,
+				    hc_rd(SDHCI_PRESENT_STATE),
+				    hc_rd(SDHCI_PRESENT_STATE) &
+				    SDHCI_CMD_INHIBIT,
+				    (unsigned long long)se.last_cmd_ns);
+			}
 			return ETIMEDOUT;
 		}
 		delay(1);
@@ -572,6 +595,56 @@ sdhci_wait_transfer_complete(void)
 			return ETIMEDOUT;
 		}
 		delay(1);
+	}
+}
+
+/*
+ * Wait until the card has actually programmed the blocks into flash.
+ *
+ * The host controller raises Transfer Complete as soon as the last byte has
+ * left the data FIFO.  That says nothing about the medium: eMMC reports an
+ * unfinished write with R1 READY_FOR_DATA == 0 and CURRENT_STATE == prg, and
+ * CMD24/CMD25 are R1 (not R1b), so DAT0 never goes busy and PRESENT_STATE
+ * cannot be used to wait.  CMD13 is the only way to ask.
+ *
+ * Returning to the VFS before programming finishes is what turns a power cut
+ * into filesystem corruption: HFS+ advances the journal checkpoint as soon as
+ * it believes the metadata reached the medium, so after a cut the journal
+ * looks empty while the blocks it describes were never written - and the next
+ * mount reads a torn B-tree node (hfs_swap_BTNode: invalid forward link).
+ */
+static int
+sdhci_wait_program_done(void)
+{
+	uint64_t deadline;
+	uint32_t r1 = 0;
+	int error;
+
+	nanoseconds_to_absolutetime(WRITE_PROGRAM_TIMEOUT_NS, &deadline);
+	deadline += mach_absolute_time();
+
+	sdhci_quiet = true;
+	for (;;) {
+		if (!(hc_rd(SDHCI_PRESENT_STATE) &
+		    (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT))) {
+			error = sdhci_cmd(13, se.rca << 16, 0,
+			    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+			    SDHCI_CMD_INDEX, &r1);
+			if (!error && (r1 & SDHCI_R1_READY_FOR_DATA) &&
+			    ((r1 & SDHCI_R1_STATE_MASK) ==
+			    (SDHCI_R1_STATE_TRAN << 9))) {
+				sdhci_quiet = false;
+				return 0;
+			}
+		}
+		if (mach_absolute_time() > deadline) {
+			sdhci_quiet = false;
+			printf("MIDO SDHCI: write did not finish programming in "
+			    "2 s (R1 0x%08x, PRESENT_STATE 0x%08x)\n", r1,
+			    hc_rd(SDHCI_PRESENT_STATE));
+			return ETIMEDOUT;
+		}
+		delay(100);
 	}
 }
 
@@ -731,7 +804,11 @@ sdhci_write_pio(uint32_t lba, uint32_t count, const void *buf)
 		sdhci_recover();
 		return error;
 	}
-	return 0;
+	error = sdhci_wait_program_done();
+	if (error) {
+		sdhci_recover();
+	}
+	return error;
 }
 
 /*
@@ -1668,6 +1745,16 @@ sdhci_flush_cache(void)
 	if (!se.ready || !se.enumerated || !se.cache_ok) {
 		return 0;
 	}
+	/*
+	 * CACHE_CTRL bit 0 is the card's write cache enable and this board
+	 * reports 0x00, so every write is already in flash once
+	 * sdhci_wait_program_done() returns: the CMD6 flush would be a no-op
+	 * that still costs a busy phase per HFS transaction.
+	 */
+	if (!se.cache_enabled) {
+		se.writes_pending = false;
+		return 0;
+	}
 
 	arg = (EXT_CSD_WRITE_BYTE << 24) | (EXT_CSD_CACHE_CTRL << 16) |
 	    (EXT_CSD_CACHE_FLUSH << 8) | EXT_CSD_CMD_SET_NORMAL;
@@ -1864,6 +1951,7 @@ sdhci_enumerate_card(void)
 		    ((uint32_t)ext[EXT_CSD_CACHE_SIZE + 2] << 16) |
 		    ((uint32_t)ext[EXT_CSD_CACHE_SIZE + 3] << 24);
 		se.cache_ok = se.cache_size != 0;
+		se.cache_enabled = (ext[32] & 0x01) != 0;
 		printf("MIDO SDHCI: EXT_CSD CACHE_SIZE %u (%llu KiB) "
 		    "CACHE_CTRL 0x%02x WR_REL_SET 0x%02x\n",
 		    se.cache_size,
@@ -1872,6 +1960,9 @@ sdhci_enumerate_card(void)
 		if (!se.cache_ok) {
 			printf("MIDO SDHCI: no write cache: every write is "
 			    "durable when the block transfer completes\n");
+		} else if (!se.cache_enabled) {
+			printf("MIDO SDHCI: write cache is present but "
+			    "disabled: no FLUSH_CACHE needed\n");
 		}
 	}
 

@@ -225,6 +225,13 @@ jobs:
           # this tells the two apart in the next boot log, and reports the
           # failing lba instead of leaving the strategy path silent.
           cp xnu/patches-mido/0121-*.patch dxb/patches/ 2>/dev/null || true
+          # 0122: do not report a write as done until the card has programmed
+          # it.  TC only means "the last byte left the FIFO"; CMD24/CMD25 are
+          # R1, so DAT0 never goes busy and CMD13 is the only way to see the
+          # programming phase.  HFS+ advances its journal checkpoint as soon
+          # as the write looks complete, so a power cut in that window leaves
+          # an empty journal over blocks that never reached flash.
+          cp xnu/patches-mido/0122-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch
