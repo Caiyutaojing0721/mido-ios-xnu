@@ -252,7 +252,16 @@
  }
  
  static unsigned int
-@@ -864,9 +1078,26 @@
+@@ -837,6 +1051,8 @@
+ 	uint64_t const *reg;
+ 	uint32_t const *val;
+ 	unsigned int size;
++	int freeze_lines;
++	char freeze_pattern[FBCON_LINE_MAX];
+ 
+ 	if (SecureDTFindEntry("name", "sweet-fbcon", &entry) != kSuccess ||
+ 	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
+@@ -864,9 +1080,26 @@
  	sweet_early_mark(17, "fbcon config read; mapping");
  	fbcon_pixels = (volatile uint8_t *)ml_io_map_wcomb(reg[0], reg[1]);
  	sweet_early_mark(18, "fbcon mapping returned");
