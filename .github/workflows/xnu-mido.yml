@@ -209,6 +209,16 @@ jobs:
           # eMMC FLUSH_CACHE (CMD6 write-byte EXT_CSD[32] bit 0) and only when
           # something was written since the previous flush.
           cp xnu/patches-mido/0119-*.patch dxb/patches/ 2>/dev/null || true
+          # 0120: make the console log readable after it has scrolled away.  The
+          # fbcon serial wraps instead of scrolling, so a crash loop overwrites
+          # the lines that explain it within a second and there is no way to
+          # copy the text off the device (no UART, no USB, no storage driver
+          # this early).  Keep the last 160 KiB of output in a ring; when
+          # "fbconhalt=<word>" matches a line (or "fbconfreeze=<lines>" is
+          # reached) stop live output and replay the ring one page at a time,
+          # holding each page for 1.8 s, then park on the last page.  Both
+          # triggers are off unless set in boot-args.
+          cp xnu/patches-mido/0120-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch

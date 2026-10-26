@@ -1,0 +1,283 @@
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -723,6 +723,71 @@
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
+ /*
++ * Log ring + freeze/replay.
++ *
++ * The console wraps around instead of scrolling, so by the time a bring-up
++ * failure settles into a crash loop the lines that explain it have already
++ * been overwritten.  Keep the last FBCON_RING_BYTES of output in a ring and,
++ * when a trigger fires, stop drawing live output and replay the ring one
++ * screen at a time -- each screen held for FBCON_REPLAY_HOLD_MS -- then park
++ * the CPU on the final screen so the tail can be photographed or filmed.
++ *
++ * Triggers, both optional, both off by default:
++ *   -v fbconhalt=corpses    freeze on the first line containing "corpses"
++ *   -v fbconfreeze=1200     freeze unconditionally after 1200 lines
++ *
++ * The screen is 60 rows x 67 columns at 1080x1920 with FBCON_SCALE 2, and
++ * the ring covers roughly 2000 lines, i.e. about 34 screens of history.
++ */
++#define FBCON_RING_BYTES        (160 * 1024)
++#define FBCON_REPLAY_HOLD_MS    1800
++#define FBCON_REPLAY_PASSES     2
++#define FBCON_LINE_MAX          96
++
++static char fbcon_ring[FBCON_RING_BYTES];
++static uint32_t fbcon_ring_pos;
++static uint32_t fbcon_ring_total;
++static char fbcon_line[FBCON_LINE_MAX];
++static uint32_t fbcon_line_len;
++static uint32_t fbcon_line_no;
++static int fbcon_frozen;
++static uint32_t fbcon_freeze_lines;
++static char fbcon_freeze_pattern[FBCON_LINE_MAX];
++static int fbcon_freeze_armed;
++
++static uint64_t
++fbcon_ticks(void)
++{
++	uint64_t v;
++	__asm__ volatile("mrs %0, cntpct_el0" : "=r"(v));
++	return v;
++}
++
++/* Only used to pace the replay; accuracy does not matter. */
++static void
++fbcon_delay_ms(uint32_t ms)
++{
++	uint64_t freq, end;
++
++	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
++	if (freq == 0) {
++		freq = 19200000;
++	}
++	end = fbcon_ticks() + (freq / 1000) * ms;
++	while (fbcon_ticks() < end) {
++		__asm__ volatile("yield");
++	}
++}
++
++static void
++fbcon_ring_put(uint8_t c)
++{
++	fbcon_ring[fbcon_ring_pos] = (char)c;
++	fbcon_ring_pos = (fbcon_ring_pos + 1) % FBCON_RING_BYTES;
++	fbcon_ring_total++;
++}
++
++/*
+  * One pixel. At 32bpp the word goes straight into the mapped buffer; at
+  * 24bpp the splash is byte-packed, one byte per channel, so the channels
+  * have to be written out individually.
+@@ -778,19 +843,23 @@
+ 	return 1;
+ }
+ 
+-static void
+-fbcon_transmit_data(uint8_t c)
++/* Returns 1 when the glyph itself pushed the cursor onto a new row. */
++static int
++fbcon_draw_char(uint8_t c)
+ {
++	int wrapped = 0;
++
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+-		return;
++		return 0;
+ 	}
+ 	if (c == '\n') {
+ 		fbcon_newline();
+-		return;
++		return 1;
+ 	}
+ 	if (fbcon_col >= fbcon_cols) {
+ 		fbcon_newline();
++		wrapped = 1;
+ 	}
+ 	const unsigned char *glyph = iso_font + c * 16;
+ 	uint32_t x0 = fbcon_col * 8 * FBCON_SCALE, y0 = fbcon_row * 16 * FBCON_SCALE;
+@@ -806,6 +875,151 @@
+ 		}
+ 	}
+ 	fbcon_col++;
++	return wrapped;
++}
++
++static int
++fbcon_contains(const char *hay, const char *needle)
++{
++	if (needle[0] == 0) {
++		return 0;
++	}
++	for (const char *h = hay; *h; h++) {
++		const char *a = h, *b = needle;
++		while (*b && *a == *b) {
++			a++;
++			b++;
++		}
++		if (*b == 0) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static int
++fbcon_trigger_hit(void)
++{
++	if (!fbcon_freeze_armed) {
++		return 0;
++	}
++	if (fbcon_freeze_pattern[0] && fbcon_contains(fbcon_line, fbcon_freeze_pattern)) {
++		return 1;
++	}
++	if (fbcon_freeze_lines && fbcon_line_no >= fbcon_freeze_lines) {
++		return 1;
++	}
++	return 0;
++}
++
++static void
++fbcon_page_header(uint32_t page, uint32_t pages)
++{
++	char buf[32];
++	int n = 0;
++
++	buf[n++] = '=';
++	buf[n++] = '=';
++	buf[n++] = ' ';
++	buf[n++] = 'P';
++	buf[n++] = 'A';
++	buf[n++] = 'G';
++	buf[n++] = 'E';
++	buf[n++] = ' ';
++	if (page >= 10) {
++		buf[n++] = (char)('0' + (page / 10) % 10);
++	}
++	buf[n++] = (char)('0' + page % 10);
++	buf[n++] = '/';
++	if (pages >= 10) {
++		buf[n++] = (char)('0' + (pages / 10) % 10);
++	}
++	buf[n++] = (char)('0' + pages % 10);
++	buf[n++] = ' ';
++	buf[n++] = '=';
++	buf[n++] = '=';
++	buf[n] = 0;
++
++	for (int i = 0; i < n; i++) {
++		fbcon_draw_char((uint8_t)buf[i]);
++	}
++	fbcon_draw_char('\n');
++}
++
++/*
++ * Replay the ring.  Never returns: once the log has been shown, the only
++ * useful thing left to do is hold the last screen still.
++ */
++static void
++fbcon_replay(void)
++{
++	uint32_t len = fbcon_ring_total < FBCON_RING_BYTES ? fbcon_ring_total : FBCON_RING_BYTES;
++	uint32_t start = fbcon_ring_total < FBCON_RING_BYTES ? 0 : fbcon_ring_pos;
++	uint32_t total_rows = 1;
++	uint32_t per_page, pages;
++
++	for (uint32_t i = 0; i < len; i++) {
++		if (fbcon_ring[(start + i) % FBCON_RING_BYTES] == '\n') {
++			total_rows++;
++		}
++	}
++	per_page = fbcon_rows > 4 ? fbcon_rows - 3 : 1;
++	pages = (total_rows + per_page - 1) / per_page;
++
++	for (int pass = 0; pass < FBCON_REPLAY_PASSES; pass++) {
++		uint32_t page = 1;
++		uint32_t rows = 0;
++
++		fbcon_init();
++		fbcon_page_header(page, pages);
++		for (uint32_t i = 0; i < len; i++) {
++			uint8_t c = (uint8_t)fbcon_ring[(start + i) % FBCON_RING_BYTES];
++
++			if (c < 0x20 && c != '\n' && c != '\r') {
++				continue;
++			}
++			if (fbcon_draw_char(c) && ++rows >= per_page) {
++				fbcon_delay_ms(FBCON_REPLAY_HOLD_MS);
++				page++;
++				rows = 0;
++				fbcon_init();
++				fbcon_page_header(page, pages);
++			}
++		}
++		fbcon_delay_ms(FBCON_REPLAY_HOLD_MS);
++	}
++
++	for (;;) {
++		__asm__ volatile("wfi");
++	}
++}
++
++static void
++fbcon_transmit_data(uint8_t c)
++{
++	int hit = 0;
++
++	if (fbcon_frozen) {
++		return;
++	}
++
++	fbcon_ring_put(c);
++
++	if (c == '\n') {
++		fbcon_line[fbcon_line_len] = 0;
++		fbcon_line_no++;
++		hit = fbcon_trigger_hit();
++		fbcon_line_len = 0;
++	} else if (c != '\r' && fbcon_line_len + 1 < FBCON_LINE_MAX) {
++		fbcon_line[fbcon_line_len++] = (char)c;
++	}
++
++	fbcon_draw_char(c);
++
++	if (hit) {
++		fbcon_frozen = 1;
++		fbcon_replay();
++	}
+ }
+ 
+ static unsigned int
+@@ -864,9 +1078,26 @@
+ 	sweet_early_mark(17, "fbcon config read; mapping");
+ 	fbcon_pixels = (volatile uint8_t *)ml_io_map_wcomb(reg[0], reg[1]);
+ 	sweet_early_mark(18, "fbcon mapping returned");
+-	if (fbcon_pixels != NULL) {
+-		register_serial_functions(&sweet_fbcon_serial_functions);
++	if (fbcon_pixels == NULL) {
++		return;
+ 	}
++
++	freeze_lines = 0;
++	freeze_pattern[0] = 0;
++	if (PE_parse_boot_argn("fbconfreeze", &freeze_lines, sizeof(freeze_lines)) &&
++	    freeze_lines > 0) {
++		fbcon_freeze_lines = (uint32_t)freeze_lines;
++		fbcon_freeze_armed = 1;
++	}
++	if (PE_parse_boot_argn("fbconhalt", freeze_pattern, sizeof(freeze_pattern)) &&
++	    freeze_pattern[0]) {
++		for (int i = 0; i < FBCON_LINE_MAX - 1 && freeze_pattern[i]; i++) {
++			fbcon_freeze_pattern[i] = freeze_pattern[i];
++		}
++		fbcon_freeze_armed = 1;
++	}
++
++	register_serial_functions(&sweet_fbcon_serial_functions);
+ }
+ 
+ #if HIBERNATION
