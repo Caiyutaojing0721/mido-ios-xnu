@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..f849d93
 --- /dev/null
 +++ b/bsd/dev/mido_sdhci.c
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,154 @@
 +/*
 + * Redmi Note 4X (mido) eMMC 5.1 root-device driver (DIAGNOSTIC MILESTONE).
 + *
@@ -51,7 +51,6 @@ index 0000000..f849d93
 +#include <sys/errno.h>
 +#include <sys/proc.h>
 +#include <sys/uio.h>
-+#include <sys/dev.h>
 +#include <miscfs/devfs/devfs.h>
 +#include <kern/locks.h>
 +#include <kern/clock.h>
@@ -185,7 +184,7 @@ index e6c74aa..0c9651b 100644
 +//	so the boot stalls after the dump instead of panicking.
 +//
 +	if (strcmp(rdBootVar, "emmcroot0") == 0) {
-+		extern "C" int mido_emmc_rootdev(dev_t *dev);
++		extern int mido_emmc_rootdev(dev_t *dev);
 +		OSSafeReleaseNULL(matching);
 +		int emmc_error = mido_emmc_rootdev(root);
 +		if (emmc_error) {
