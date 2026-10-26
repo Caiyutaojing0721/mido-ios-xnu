@@ -1,0 +1,117 @@
+mido: accept 16 KiB code-signing granularity on a 4 KiB-paged kernel
+
+launchd never got past dyld:
+
+  disallowing unsupported code signature page shift:14
+  unable to create a validated cs_blob object: 85
+  dylib cache "(null)" not loaded: code signature registration for shared cache failed
+  shared_region: vm_shared_region_start_address() failed
+  panic: initproc failed to start -- exit reason namespace 6 subcode 0x1
+         Library not loaded: /usr/lib/libSystem.B.dylib
+
+Root cause is not the root filesystem.  HFS+ mounts, dyld finds the shared
+cache directory (/System/Library/Caches/com.apple.dyld/, hard-linked out of the
+cryptex), opens the cache and asks the kernel to register its code signature.
+The kernel refuses, and that single EBADEXEC unwinds everything above.
+
+Why it refuses: every arm64 Apple binary is signed with a 16 KiB code-signing
+granularity, i.e. CS_CodeDirectory.pageSize == 14 (the field is log2, so it is
+a *shift*, and XNU prints it raw -- "shift:14").  cs_validate_codedirectory()
+only accepts 12 or the kernel's own PAGE_SHIFT, and 0102/0103 pinned PAGE_SHIFT
+to 12 because the Cortex-A53 in the SDM8953 implements no 16 KiB translation
+granule (ID_AA64MMFR0_EL1.TGran16 == 0).  4 KiB pages are not a choice on this
+SoC, so the 16 KiB signature has to be accepted instead.  Raising the reported
+DRAM size (the stock ">1 GB => 16 KiB pages" rule) cannot work here for the same
+reason: with TG0/TG1 = 0b10 there is no mapping at all, which is the silent
+death 0102 describes.
+
+Two changes, and both are needed:
+
+  * cs_validate_codedirectory(): also accept PAGE_SHIFT_16K.  Without this the
+    blob is never created, so no later step can help.
+
+  * cs_validate_hash(): for a blob whose granularity is wider than PAGE_SIZE,
+    report the subrange validated and consumed instead of hashing it.  This is
+    not cosmetic: a fault hands that function exactly one 4 KiB page, so a
+    16 KiB hash cannot be recomputed from it, and cs_validate_page() would call
+    it again at a 4 KiB offset that is not a multiple of 16384 and take the
+    "offset not aligned to cshash boundary" panic instead.  cs_validate_page()
+    already has the matching case for exactly this shape (offset_in_page == 0
+    and bytes_processed > PAGE_SIZE - FOURK_PAGE_SIZE sets VMP_CS_ALL_TRUE), so
+    reporting one full granularity is what that caller expects.
+
+XNU itself only supports the opposite direction (16 KiB kernel pages over a
+4 KiB-signed blob, ubc_cs_convert_to_multilevel_hash(), guarded by
+"PAGE_SHIFT <= csb_hash_pageshift -> nothing to do"): there is no path to
+re-derive coarser hashes from finer pages.  Waiving the per-page hashes is the
+only option short of re-signing the whole 2.6 GB shared cache, and this port
+already requires launchd_unsecure_cache=1 to boot at all.
+
+Everything else in the blob is still checked exactly as before: magic, hash
+type and size, hashOffset/identOffset/scatter bounds, codeLimit, code slots and
+the cdhash over the Code Directory, plus entitlements.  Only the page hashes of
+16 KiB-signed blobs go unchecked.
+
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -124,6 +124,8 @@
+ extern int cs_debug;
+ 
+ #define PAGE_SHIFT_4K           (12)
++/* mido: iOS arm64 userland signs every 16 KiB (cd->pageSize is log2). */
++#define PAGE_SHIFT_16K          (14)
+ 
+ static boolean_t
+ cs_valid_range(
+@@ -371,7 +373,24 @@
+ 	if (ntohl(cd->magic) != CSMAGIC_CODEDIRECTORY) {
+ 		return EBADEXEC;
+ 	}
+-	if ((cd->pageSize != PAGE_SHIFT_4K) && (cd->pageSize != PAGE_SHIFT)) {
++	/*
++	 * mido: accept a code-signing granularity wider than the kernel page size.
++	 *
++	 * iOS arm64 userland is signed with 16 KiB hashes (pageSize == 14) while
++	 * this kernel runs 4 KiB pages: a Cortex-A53 implements no 16 KiB
++	 * translation granule, so PAGE_SHIFT is 12 and every Apple binary would be
++	 * rejected with EBADEXEC (85).  That is what kills launchd:
++	 *
++	 *   disallowing unsupported code signature page shift:14
++	 *   unable to create a validated cs_blob object: 85
++	 *
++	 * A single 4 KiB page cannot reproduce a 16 KiB hash, so cs_validate_hash()
++	 * waives the per-page comparison for such blobs instead of hashing the
++	 * wrong bytes.  The blob structure, the entitlements and the cdhash are
++	 * still validated here exactly like any other blob.
++	 */
++	if ((cd->pageSize != PAGE_SHIFT_4K) && (cd->pageSize != PAGE_SHIFT) &&
++	    (cd->pageSize != PAGE_SHIFT_16K)) {
+ 		printf("disallowing unsupported code signature page shift: %u\n", cd->pageSize);
+ 		return EBADEXEC;
+ 	}
+@@ -5726,6 +5745,24 @@
+ 			if (hashtype->cs_digest_size > sizeof(actual_hash)) {
+ 				panic("hash size too large");
+ 			}
++			/*
++			 * mido: blob signed at a wider granularity than the kernel page
++			 * size (iOS arm64: 16 KiB hashes, 4 KiB kernel pages).
++			 *
++			 * cs_validate_range() and cs_validate_page() only ever hand us
++			 * PAGE_SIZE bytes, so the wider hash cannot be recomputed here --
++			 * and cs_validate_page() would otherwise fault a page at an offset
++			 * that is not a multiple of the blob granularity and panic on the
++			 * alignment check below.  Report the subrange as validated and
++			 * consumed (one blob-granularity step) so the fault path accepts
++			 * the mapping.  This port already boots with
++			 * launchd_unsecure_cache=1, i.e. an unsealed userland.
++			 */
++			if ((1U << blob->csb_hash_pageshift) > PAGE_SIZE) {
++				*bytes_processed = (1U << blob->csb_hash_pageshift);
++				*tainted = 0;
++				return TRUE;
++			}
+ 			if (offset & ((1U << blob->csb_hash_pageshift) - 1)) {
+ 				panic("offset not aligned to cshash boundary");
+ 			}

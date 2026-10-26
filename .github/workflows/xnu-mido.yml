@@ -190,6 +190,15 @@ jobs:
           # power so the serial console shows the host state, then refuse to
           # mount (ENXIO, non-panicking) until the real block-I/O milestone.
           cp xnu/patches-mido/0117-*.patch dxb/patches/ 2>/dev/null || true
+          # 0118: accept the 16 KiB code-signing granularity iOS arm64 userland
+          # actually uses.  0102/0103 pinned PAGE_SHIFT to 12 (a Cortex-A53 has
+          # no 16 KiB translation granule), so cs_validate_codedirectory()
+          # rejected every Apple blob -- including the dyld shared cache -- with
+          # EBADEXEC (85), and launchd died with "Library not loaded:
+          # /usr/lib/libSystem.B.dylib".  The per-page hashes of such blobs are
+          # waived (one 4 KiB page cannot reproduce a 16 KiB hash), everything
+          # else in the blob is still validated.
+          cp xnu/patches-mido/0118-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch
