@@ -165,6 +165,14 @@ jobs:
           # GICD_SGIR is CPUTargetList[23:16] | SGIINTID[3:0] |
           # TargetListFilter[25:24]; cluster 0 core N is CPU interface N.
           cp xnu/patches-mido/0114-*.patch dxb/patches/ 2>/dev/null || true
+          # 0115-* closes the secondary handshake.  cpu1 powered on (PSCI rc=0)
+          # and ran initCPU, but never reported "came alive": the self-SGI is
+          # sent while that core still has DAIF.I set, so on a GIC-400 -- whose
+          # GICC_CTLR/PMR are banked per core -- it can simply be lost.  initCPU
+          # now enables its own CPU interface first, startAll re-arms the IPI
+          # every ~200 ms, and both sides print enough to tell "core stuck" from
+          # "core up, IPI lost".
+          cp xnu/patches-mido/0115-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch
