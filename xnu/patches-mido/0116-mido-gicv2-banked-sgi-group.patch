@@ -1,0 +1,91 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index cf40e4e..47b0723 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -23,6 +23,7 @@ extern "C" boolean_t sweet_gicv2;
+ extern "C" vm_offset_t sweet_gicd_base;
+ extern "C" void sweet_gicv2_cpu_enable(void);
+ extern "C" void sweet_gicv2_cpu_dump(unsigned int cpu);
++extern "C" void sweet_gicv2_sgi_probe(unsigned int cpu);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ 
+ class SweetCPU;
+@@ -247,6 +248,7 @@ SweetCPU::initCPU(bool boot)
+ 	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
+ 	sweet_gicv2_cpu_dump(getCPUNumber());
++	sweet_gicv2_sgi_probe(getCPUNumber());
+ 	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+ }
+ 
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 5c290f8..c43f2ac 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -132,10 +132,32 @@ sweet_dt_compat_has(DTEntry entry, const char *want)
+ static void
+ sweet_gicv2_percpu(void)
+ {
++	/*
++	 * GICD_IGROUPR0 / GICD_ISENABLER0 / GICD_IPRIORITYR0-7 are banked per
++	 * PE for INTID 0-31 (SGIs + PPIs) -- ARM IHI0048B 4.3.6: "In a
++	 * multiprocessor implementation, GICD_IGROUPR0 is banked for each
++	 * connected processor."  The loops in sweet_gicv2_setup() run on the
++	 * boot PE only, so they program only its bank.  A secondary's SGI thus
++	 * keeps its reset group (Group 0 -> FIQ) and an IPI aimed at it is taken
++	 * as an FIQ that sleh_irq()/cpu_signal_handler() never see -- exactly
++	 * the "cpu is up, GICC is open, but the handshake never completes"
++	 * symptom.  Every PE must set its OWN banked SGIs to Group 1 (IRQ).
++	 * Re-writing the boot PE's bank here is idempotent.  (gem5 calls this
++	 * per-PE bank GicV2::BankedRegs: intGroup/intEnabled/intPriority.)
++	 */
++	_gic_write32(sweet_gicd_base + GICV2_DIST_IGROUPR, 0xFFFFFFFF);   /* SGI+PPI -> Group 1 (IRQ) */
++	for (uint32_t i = 0; i < 8; i++) {
++		_gic_write32(sweet_gicd_base + GICV2_DIST_IPRIORITYR + i * 4, 0xA0A0A0A0);
++	}
++	/* Enable this PE's SGI1 (the IPI) and the virtual-timer PPI. */
++	_gic_write32(sweet_gicd_base + GICV2_DIST_ISENABLER,
++	    (1U << SWEET_IPI_SGI) | (1U << sweet_vtimer_intid));
++
+ 	_gic_write32(sweet_gicc_base + GICV2_CPU_PMR, 0xFF);
+ 	_gic_write32(sweet_gicc_base + GICV2_CPU_BPR, 0x00);
+ 	_gic_write32(sweet_gicc_base + GICV2_CPU_CTLR, 0x01);   /* EnableGrp1, NS view */
+ 	_gic_write32(sweet_gicd_base + GICV2_DIST_CTLR, 0x01);  /* EnableGrp1, NS view */
++	__builtin_arm_dsb(DSB_ISHST);
+ 	__builtin_arm_isb(ISB_SY);
+ }
+ 
+@@ -215,6 +237,33 @@ sweet_gicv2_cpu_dump(unsigned int cpu)
+ 		    _gic_read32(sweet_gicc_base + GICV2_CPU_BPR));
+ 	}
+ }
++
++/*
++ * Ground truth for the SGI handshake, read from THIS core's banked GIC-400
++ * state.  Because GICD_IGROUPR0/IPRIORITYR0/ISENABLER0 are banked per PE,
++ * what we read here is exactly what the controller will decide when
++ * SWEET_IPI_SGI arrives on this core: Group 0 -> FIQ (sleh_irq never runs,
++ * so the handshake can never complete), Group 1 -> IRQ (cpu_signal_handler);
++ * and a priority >= GICC_PMR is masked at the CPU interface before either.
++ */
++void
++sweet_gicv2_sgi_probe(unsigned int cpu)
++{
++	if (!sweet_gicv2) {
++		return;
++	}
++	uint32_t const sgi = SWEET_IPI_SGI;
++	uint32_t const grp = (_gic_read32(sweet_gicd_base + GICV2_DIST_IGROUPR) >> sgi) & 1U;
++	uint32_t const pr = _gic_read32(sweet_gicd_base + GICV2_DIST_IPRIORITYR + (sgi / 4) * 4);
++	uint32_t const sgi_prio = (pr >> ((sgi % 4) * 8)) & 0xFFU;
++	uint32_t const en = (_gic_read32(sweet_gicd_base + GICV2_DIST_ISENABLER + (sgi / 32) * 4) >> (sgi % 32)) & 1U;
++	uint32_t const ctlr = _gic_read32(sweet_gicc_base + GICV2_CPU_CTLR);
++	uint32_t const pmr = _gic_read32(sweet_gicc_base + GICV2_CPU_PMR);
++	kprintf("SWEET GICv2 SGI: cpu=%u sgi=%u group=%u(%s) prio=0x%02x en=%u "
++	    "ctlr=0x%02x pmr=0x%02x => %s/%s\n",
++	    cpu, sgi, grp, grp ? "1/IRQ" : "0/FIQ", sgi_prio, en, ctlr, pmr,
++	    grp ? "IRQ" : "FIQ!", (sgi_prio < pmr) ? "unmasked" : "MASKED");
++}
+ #endif /* SWEET */
+ 
+ void

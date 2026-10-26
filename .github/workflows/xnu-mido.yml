@@ -173,6 +173,18 @@ jobs:
           # every ~200 ms, and both sides print enough to tell "core stuck" from
           # "core up, IPI lost".
           cp xnu/patches-mido/0115-*.patch dxb/patches/ 2>/dev/null || true
+          # 0116-* programs the banked SGI group on every PE.  0109's
+          # distributor loops run on the boot PE only, but GICD_IGROUPR0/
+          # ISENABLER0/IPRIORITYR0-7 are banked per PE for INTID 0-31
+          # (ARM IHI0048B 4.3.6).  A secondary's SGI1 therefore keeps its
+          # reset group (Group 0 = FIQ): an IPI aimed at it is taken as an
+          # FIQ that sleh_irq()/cpu_signal_handler() never see, so the
+          # handshake stalls even with the CPU interface open -- "cpu up,
+          # GICC open, no came alive".  sweet_gicv2_percpu() now writes each
+          # PE's own bank (IGROUPR0=Group1, IPRIORITYR, and its SGI1+vtimer
+          # enable) and sweet_gicv2_sgi_probe() prints the per-core
+          # group/priority/PMR the controller will actually decide with.
+          cp xnu/patches-mido/0116-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch
