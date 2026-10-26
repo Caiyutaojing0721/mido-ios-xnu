@@ -1365,6 +1365,96 @@ sed -i '' 's|xcodebuild install -target libfirehose_kernel |xcodebuild install -
 
 旧的 `check_lse.py` 结论（"5 处 firehose 是已知例外"）**作废**。
 
+### 1.11 第一次真正跑起 SMP 代码：MPIDR 布局搞反了（0113/0114）
+
+剪掉 firehose 之后，这一版是整个 port 里走得最远的一次——屏幕滚出了：
+
+```
+zone_init: map GEN1/GEN2/GEN3/DATA/metadata/metabits ...
+VM bootstrap done: 61 maps, 112 entries and 117 holes left
+IOKit IOMD setownership ENABLED
+ATM / BANK / IPC_PTHREAD subsystem is initialized
+mig_table_max_displ = 54  mach_kobj_count = 374
+Initializing KDP    iBoot version: mido-shim
+SWEET PRNG: HMAC-SHA256 registered
+SWEET pthread: libthread-514.100.2 registered
+SWEET AMFI: built-in interface registered (XML entitlements)
+Security policy loaded: Guarded vnode policy (vanguard)
+SWEET: starting device-tree platform expert
+SWEET: platform expert registered
+[10] ml_processor_register>cpu_id ... cluster_id 0 cpu_number 0 is type 0
+```
+
+即 1.9/1.10 之后的所有关都过了：zone、VM、IOKit、MIG、KDP、AMFI、平台专家。
+然后死在**第一个从核**上：
+
+```
+panic(cpu 0 caller ...): SWEET CPU: invalid topology
+cpu=1 mpidr=0x1 count=4 @//sweetcpu.cpp/:82
+```
+
+#### 1.11.1 检查写的是 SM7150 的布局
+
+0078 的检查（`SweetCPU::start`）是给 polaris/sweet 写的：
+
+```c
+/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 || ...)
+```
+
+Kryo 470 是"**核号放 Aff1、Aff0 恒 0**"（0x000/0x100/…/0x700）。MSM8953 是标准的
+ARM 布局 `Cluster.Aff1 : Core.Aff0`，即 **0x0–0x3 和 0x100–0x103**。所以 cpu1 报
+`mpidr=0x1` 是**对的**，是检查错了。
+
+#### 1.11.2 为什么现在只放 cluster 0
+
+两个地方都假设 `phys_id == 逻辑号`，而且都只对 cluster 0 成立：
+
+1. 从核复位桩用 `MPIDR & 0xffff` 去索引 `CpuDataEntries[]`
+   （`osfmk/arm64/start.s`，`HAS_CLUSTER || SWEET`）；
+2. `ml_processor_register()` 用**逻辑号**去索引同一个数组。
+
+cluster 1 的 `0x100+` 会把 (1) 变成 256 以上的下标，直接越过数组。要让 cluster 1
+上线，得先在复位路径里做一次 logical→physical 重映射，所以：
+
+```c
+if ((cpu->phys_id & ~0x3u) != 0 || topology->num_cpus > 4 ||
+    cpu->cpu_id != (uint32_t)cpu->phys_id) {
+	panic("SWEET CPU: unsupported mido topology ... (cluster 0 only, ...)");
+}
+```
+
+顺手把 CPU 名字从 `"Kryo 470"` 改成 `"Cortex-A53"`——mido 不是 Kryo，名字写错只会在
+后面查 sysctl 时误导人。
+
+#### 1.11.3 把 cpus 变成可调参数
+
+`tools/mkpayload.py --cpus N`（`out/pipeline_mido.sh` 认 `CPUS=$N`）：**内核二进制不变**，
+只改 payload 里的 `cpus=` boot-arg。这样同一个内核可以出两张镜像——
+
+- `cpus=1`：绕开从核 bring-up，专看下一个子系统的坑；
+- `cpus=4`：真正验证 PSCI CPU_ON / 复位桩 / GIC SGI。
+
+#### 1.11.4 0114：GIC-400 必须能跨核发 SGI
+
+0110 的 GIC-400 分支把 `GICD_SGIR` 写死成 `TargetListFilter = 0b10`（只发给发起者自己），
+遇到任何非自身目标就 panic。自检够用，**但多核跑起来就会立刻炸**：XNU 一旦有第二个 CPU
+就会发定向 IPI（AST、TLB shootdown）。
+
+GICv2 的 `GICD_SGIR` 是 `TargetListFilter[25:24] | CPUTargetList[23:16] | SGIINTID[3:0]`
+（Linux 写作 `map << 16 | irq`，QEMU 的 GICv2 就是按这个解）。0110 里的
+`(2 << 24) | SGI` 在这个布局下**本来就是对的**（`0b10` = 本核）。跨核只要换成
+`(1 << (16 + aff0)) | SGI`，因为 cluster 0 的核 N 就是 CPU interface N——和
+`GICD_ITARGETSR` 给 SPI 用的位是同一套。
+
+cluster 1 的 CPU interface 映射还没确定，所以仍然 panic，但换成了明确的报错。
+
+#### 1.11.5 下一关
+
+`SweetCPU` 之后是 IOKit 的其余部分、BSD init，最后是**根设备**（`rd=emmcroot0` 目前是
+占位符，`0095-mido_emmc.patch` 只有 83 行 stub）。看到 `IOFindBSDRoot` 失败之前，
+eMMC/SD 都不用动。
+
 ## 2. 交付物一览
 
 ```
