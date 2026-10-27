@@ -29,6 +29,9 @@ signal number alone.
 
 Bounded to 64 reports: when launchd dies it takes a dozen daemons with it and
 the console ring only holds about 2000 lines.
+
+The pid comes from task_pid(current_task()); `struct thread` as seen here has
+no `task` member, so the first cut did not compile.
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -42,6 +42,7 @@
@@ -60,7 +63,7 @@ the console ring only holds about 2000 lines.
 +				mido_ufault_reports++;
 +				kprintf("MIDO UFAULT %u: pid %d kr 0x%x addr 0x%llx "
 +				    "prot 0x%x pc 0x%llx lr 0x%llx sp 0x%llx esr 0x%x\n",
-+				    mido_ufault_reports, task_pid(thread->task),
++				    mido_ufault_reports, task_pid(current_task()),
 +				    result, (unsigned long long)vm_fault_addr,
 +				    fault_type,
 +				    (unsigned long long)get_saved_state_pc(state),
