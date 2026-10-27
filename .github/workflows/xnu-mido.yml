@@ -252,6 +252,16 @@ jobs:
           # to the alternate header at the volume end, and refuse to send a
           # header write whose payload is not a plausible volume header.
           cp xnu/patches-mido/0124-*.patch dxb/patches/ 2>/dev/null || true
+          # 0125: map the dyld shared cache with no slide, at the point where the
+          # slide is actually consumed.  0123 did it in the BSD layer and a boot
+          # still showed the pager relocating the cache
+          # ("vm_shared_region_slide_page() offset overflow: pageIndex=9056,
+          # start_offset=0, slide_amount=120401920"), which fails the fault and
+          # SIGBUSes SpringBoard.  Clear the slide and VM_PROT_SLIDE on every
+          # mapping inside vm_shared_region_map_file(), before the slide count
+          # is taken: no slid mappings, no shared-region pager, no rebase chain,
+          # and sr_slide stays 0 so dyld sees a slide of zero.
+          cp xnu/patches-mido/0125-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch

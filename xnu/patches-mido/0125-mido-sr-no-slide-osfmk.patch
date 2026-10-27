@@ -1,0 +1,145 @@
+mido: install the dyld shared cache unslid, in the VM layer this time
+
+0123 tried to remove the shared cache slide from the BSD side, in
+shared_region_map_and_slide_setup().  A boot with 0123 still shows the pager
+relocating the cache:
+
+  vm_shared_region_slide_page() offset overflow:
+      pageIndex=9056, start_offset=0, slide_amount=120401920
+
+so that is not where the decision sticks (or, more likely, the image that
+produced that log was not the 0123 one -- the same log also shows
+"flushing fs disk buffer returned 0x19" and "unable to create a validated
+cs_blob object: 85", which 0119/0122 and 0118 had already removed).
+
+Rather than guess which layer wins, this patch sits where the slide is
+actually consumed.  vm_shared_region_map_file() counts the mappings that carry
+VM_PROT_SLIDE and allocates the per-slide bookkeeping from that count, then
+vm_shared_region_map_file_setup() installs those mappings and
+vm_shared_region_slide() creates a shared-region pager for each of them.  Clear
+the slide and VM_PROT_SLIDE on every mapping before that count is taken and:
+
+  * vmsr_num_slides becomes 0, so no slid_mappings, no slide info copyin, no
+    vm_shared_region_slide() call, hence no pager and no rebase chain;
+  * shared_region->sr_slide stays 0, so si_slide is 0 everywhere;
+  * the cache is mapped directly from the cache file at the nominal addresses
+    dyld asked for, byte for byte as dyld built it;
+  * dyld derives slide == 0 from _shared_region_check_np() and is consistent
+    with itself.
+
+This is exactly the macOS-without-ASLR shape of the mapping.  What it costs is
+randomisation, which this port does not have anyway.  What it buys is that
+vm_shared_region_slide_page() can no longer take SIGBUS in every process that
+touches slid __DATA.
+
+srslide=1 restores the stock behaviour, and the patch prints
+
+  MIDO SR 0125: noslide, dyld slide 0x... dropped for N file(s), M slid mapping(s)
+
+on every map call so a boot log tells which path was taken.
+
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -117,6 +117,7 @@
+ #include <machine/cpu_capabilities.h>
+ #include <sys/random.h>
+ #include <sys/errno.h>
++#include <pexpert/pexpert.h>
+ 
+ #if defined(__arm64__)
+ #include <arm/cpu_data_internal.h>
+@@ -1920,6 +1921,84 @@
+ 	mach_vm_offset_t   sfm_max_address);
+ 
+ /*
++ * mido: install the dyld shared cache without a slide.
++ *
++ * dyld asks the kernel to place the cache at a random offset and to relocate
++ * every VM_PROT_SLIDE page as it is faulted in.  That relocation runs through
++ * vm_shared_region_slide_page(), which walks the rebase chains of the cache
++ * with the page arithmetic of the kernel.  On this cache the walk runs off the
++ * end of the page:
++ *
++ *   vm_shared_region_slide_page() offset overflow:
++ *       pageIndex=9056, start_offset=0, slide_amount=120401920
++ *
++ * The pager then fails that fault and every process that touches slid __DATA
++ * dies of SIGBUS -- SpringBoard first, then whatever tries to report it.
++ * Randomisation buys nothing on this port, so drop it: clear the slide and
++ * VM_PROT_SLIDE on every mapping before the slide count is taken below.  The
++ * cache is then mapped straight from the file at its nominal addresses, no
++ * shared-region pager and no rebase chain is ever involved, and dyld derives a
++ * slide of zero from _shared_region_check_np().
++ *
++ * Boot with srslide=1 to get the stock behaviour back.
++ */
++static int
++mido_noslide(void)
++{
++	static int decided;
++	static int enabled = 1;
++
++	if (!decided) {
++		int keep = 0;
++
++		decided = 1;
++		if (PE_parse_boot_argn("srslide", &keep, sizeof(keep))) {
++			enabled = (keep == 0);
++		}
++	}
++	return enabled;
++}
++
++static void
++mido_sr_drop_slides(
++	struct _sr_file_mappings *sr_file_mappings,
++	int                      sr_file_mappings_count)
++{
++	struct _sr_file_mappings *srfmp;
++	uint32_t                 reported_slide = 0;
++	uint32_t                 files_with_slide = 0;
++	uint32_t                 slid_mappings = 0;
++	unsigned int             i;
++
++	if (!mido_noslide()) {
++		return;
++	}
++
++	for (srfmp = &sr_file_mappings[0];
++	    srfmp < &sr_file_mappings[sr_file_mappings_count];
++	    srfmp++) {
++		if (srfmp->slide != 0) {
++			if (reported_slide == 0) {
++				reported_slide = srfmp->slide;
++			}
++			srfmp->slide = 0;
++			files_with_slide++;
++		}
++		for (i = 0; i < srfmp->mappings_count; i++) {
++			if (srfmp->mappings[i].sms_max_prot & VM_PROT_SLIDE) {
++				srfmp->mappings[i].sms_max_prot &=
++				    ~VM_PROT_SLIDE;
++				slid_mappings++;
++			}
++		}
++	}
++
++	printf("MIDO SR 0125: noslide, dyld slide 0x%x dropped for %u file(s), "
++	    "%u slid mapping(s) installed unslid\n",
++	    reported_slide, files_with_slide, slid_mappings);
++}
++
++/*
+  * Establish some mappings of a file in the shared region.
+  * This is used by "dyld" via the shared_region_map_np() system call
+  * to populate the shared region with the appropriate shared cache.
+@@ -1950,6 +2029,8 @@
+ 	struct shared_file_mapping_slide_np **mappings_to_slide = NULL; /* [0..vmsr_num_slides] */
+ 	struct _sr_file_mappings *srfmp;
+ 
++	mido_sr_drop_slides(sr_file_mappings, sr_file_mappings_count);
++
+ 	/*
+ 	 * Figure out how many of the mappings have slides.
+ 	 */
