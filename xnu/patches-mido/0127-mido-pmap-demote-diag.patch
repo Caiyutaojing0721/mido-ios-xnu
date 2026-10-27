@@ -1,0 +1,39 @@
+mido: record who asks for an L2 demotion
+
+One of the two failure shapes on this port is a boot that dies in the pmap
+before userland:
+
+  panic(cpu 0 caller 0xfffffff007a84c74): pmp_tte: Attempt to demote a L2
+  block, tte=0x00d99d6c0005, pmap=0xfffffff007bd7370, target_level=3,
+  addr=0xfffffff0085c000 pmap_pt_geometry.h:349
+
+addr is 0xe000 past the end of the kernel image (0xfffffff0084e4000), i.e. the
+first page of the kernel map that is free for allocation, and it falls inside the
+2 MiB block that covers the tail of the kernel image.  Something enters a 4 KiB
+mapping there, the walk finds a block instead of a table, and MACH_ASSERT fires.
+
+The printed "caller" is the return address inside panic(), which lands in a cold
+section and cannot be symbolized (it resolves to _mac_file_check_lock + 0x74,
+which is nonsense).  Print the return address of pmap_tte() itself instead, so
+the next occurrence names the function that tried to install the mapping.
+
+diff --git a/osfmk/arm/pmap/pmap_pt_geometry.h b/osfmk/arm/pmap/pmap_pt_geometry.h
+--- a/osfmk/arm/pmap/pmap_pt_geometry.h
++++ b/osfmk/arm/pmap/pmap_pt_geometry.h
+@@ -545,8 +545,14 @@
+ 
+ #if MACH_ASSERT
+ 		if ((tte & (ARM_TTE_TYPE_MASK | ARM_TTE_VALID)) == (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID)) {
+-			panic("%s: Attempt to demote L%u block, tte=0x%llx, pmap=%p, target_level=%u, addr=%p",
+-			    __func__, cur_level, tte, pmap, target_level, (void*)addr);
++			/* mido: who asked for this?  The panic caller lands in a cold
++			 * section, so the address in "panic(cpu 0 caller 0x...)" is
++			 * useless for symbolication; record the real return address of
++			 * this helper instead. */
++			panic("%s: Attempt to demote L%u block, tte=0x%llx, pmap=%p, "
++			    "target_level=%u, addr=%p, from=%p",
++			    __func__, cur_level, tte, pmap, target_level, (void*)addr,
++			    __builtin_return_address(0));
+ 		}
+ #endif
+ 		if ((tte & (ARM_TTE_TYPE_MASK | ARM_TTE_VALID)) != (ARM_TTE_TYPE_TABLE | ARM_TTE_VALID)) {

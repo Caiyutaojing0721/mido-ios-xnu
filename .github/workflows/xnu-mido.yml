@@ -262,6 +262,20 @@ jobs:
           # is taken: no slid mappings, no shared-region pager, no rebase chain,
           # and sr_slide stays 0 so dyld sees a slide of zero.
           cp xnu/patches-mido/0125-*.patch dxb/patches/ 2>/dev/null || true
+          # 0126: 0125 dropped the slide but left the mapping where dyld put it.
+          # dyld folds the slide into sms_address itself, so the cache ended up
+          # moved by 0x3514000 and not relocated; launchd then read
+          # check_np() = 0x183514000, still computed a slide of 0x3514000 and
+          # died with a signal ("initproc failed to start -- exit reason
+          # namespace 2 subcode 0x0").  Subtract the slide from sms_address too,
+          # so the region starts at SHARED_REGION_BASE_ARM64 and dyld derives a
+          # slide of zero.
+          cp xnu/patches-mido/0126-*.patch dxb/patches/ 2>/dev/null || true
+          # 0127: the other boot shape dies in pmap_tte ("Attempt to demote a L2
+          # block") at 0xfffffff0085c000, i.e. the first free page of the kernel
+          # map, inside the 2 MiB block that covers the tail of the kernel image.
+          # Print pmap_tte()'s own return address so the panic names the caller.
+          cp xnu/patches-mido/0127-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch

@@ -1,0 +1,100 @@
+mido: also pull the shared cache back to its nominal addresses
+
+0125 dropped the slide and VM_PROT_SLIDE from every mapping, and the cache was
+then mapped with no pager and no rebase chain -- but launchd died on the very
+next syscall:
+
+  MIDO SR 0125: noslide, dyld slide 0x0 dropped for 0 file(s), 0 slid mappings
+  MIDO SR: launchd check_np -> 0x183514000
+  pid 1 exited -- exit reason namespace 2 subcode 0x0, description none
+  panic: initproc failed to start -- exit reason namespace 2 ...
+
+(namespace 2 is OS_REASON_SIGNAL, i.e. launchd took a fault.)
+
+The mistake is that dyld does not hand the kernel an unslid address and let it
+add the slide.  It folds the slide into sms_address itself, and passes the slide
+separately only so the kernel knows how far to relocate the *contents*:
+
+  nominal base                      0x180000000   (SHARED_REGION_BASE_ARM64)
+  dyld's requested slide            0x03514000
+  address dyld asks for             0x183514000
+  check_np() after 0125             0x183514000   (= base + sr_first_mapping)
+
+So clearing the slide left the cache moved by 0x3514000 but not relocated: the
+mapping sits at nominal+slide, dyld reads that base back, still computes a slide
+of 0x3514000, and the first shared-cache pointer it dereferences is 0x3514000
+off.  Zeroing the slide without moving the mapping is worse than doing nothing.
+
+Fix: after zeroing srfmp->slide, subtract it from every sms_address of that file.
+The region then starts at SHARED_REGION_BASE_ARM64, check_np() returns the
+nominal base, dyld derives slide == 0, and the unreslid contents match.
+
+The print now shows both addresses so a boot log proves the arithmetic:
+
+  MIDO SR 0126: noslide, dyld slide 0x3514000 dropped for 1 file(s),
+      63 slid mapping(s); first mapping now 0x180000000 (was 0x183514000)
+
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -1968,6 +1968,7 @@
+ 	uint32_t                 reported_slide = 0;
+ 	uint32_t                 files_with_slide = 0;
+ 	uint32_t                 slid_mappings = 0;
++	uint32_t                 slide;
+ 	unsigned int             i;
+ 
+ 	if (!mido_noslide()) {
+@@ -1977,14 +1978,34 @@
+ 	for (srfmp = &sr_file_mappings[0];
+ 	    srfmp < &sr_file_mappings[sr_file_mappings_count];
+ 	    srfmp++) {
+-		if (srfmp->slide != 0) {
++		slide = srfmp->slide;
++		if (slide != 0) {
+ 			if (reported_slide == 0) {
+-				reported_slide = srfmp->slide;
++				reported_slide = slide;
+ 			}
+ 			srfmp->slide = 0;
+ 			files_with_slide++;
+ 		}
+ 		for (i = 0; i < srfmp->mappings_count; i++) {
++			/*
++			 * dyld already folded the slide into sms_address: it asks for
++			 * the cache at (nominal + slide) and passes the slide
++			 * separately so the kernel can relocate the pages.  Dropping
++			 * the slide alone therefore leaves the cache *moved* but not
++			 * relocated, and dyld then reads the mapping back through
++			 * _shared_region_check_np(), still computes a slide of
++			 * 0x3514000 and dies on the first pointer it follows:
++			 *
++			 *   MIDO SR: launchd check_np -> 0x183514000
++			 *   pid 1 exited -- exit reason namespace 2 subcode 0x0
++			 *
++			 * Pull the addresses back to the nominal ones as well, so the
++			 * region starts at SHARED_REGION_BASE_ARM64 and dyld derives
++			 * slide == 0 from check_np.
++			 */
++			if (slide != 0 && srfmp->mappings[i].sms_address >= slide) {
++				srfmp->mappings[i].sms_address -= slide;
++			}
+ 			if (srfmp->mappings[i].sms_max_prot & VM_PROT_SLIDE) {
+ 				srfmp->mappings[i].sms_max_prot &=
+ 				    ~VM_PROT_SLIDE;
+@@ -1993,9 +2014,12 @@
+ 		}
+ 	}
+ 
+-	printf("MIDO SR 0125: noslide, dyld slide 0x%x dropped for %u file(s), "
+-	    "%u slid mapping(s) installed unslid\n",
+-	    reported_slide, files_with_slide, slid_mappings);
++	printf("MIDO SR 0126: noslide, dyld slide 0x%x dropped for %u file(s), "
++	    "%u slid mapping(s); first mapping now 0x%llx (was 0x%llx)\n",
++	    reported_slide, files_with_slide, slid_mappings,
++	    (unsigned long long)sr_file_mappings[0].mappings[0].sms_address,
++	    (unsigned long long)(sr_file_mappings[0].mappings[0].sms_address +
++	    reported_slide));
+ }
+ 
+ /*
