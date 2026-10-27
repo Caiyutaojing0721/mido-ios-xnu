@@ -276,6 +276,12 @@ jobs:
           # map, inside the 2 MiB block that covers the tail of the kernel image.
           # Print pmap_tte()'s own return address so the panic names the caller.
           cp xnu/patches-mido/0127-*.patch dxb/patches/ 2>/dev/null || true
+          # 0128: the common shape now dies as "pid 1 exited -- exit reason
+          # namespace 2 subcode 0xb" (SIGSEGV) with the cache correctly at
+          # 0x180000000, and nothing says which fault killed it.  Print pid,
+          # fault address, pc/lr/sp and esr from handle_user_abort(), after
+          # vm_fault() has failed and before the signal is delivered.
+          cp xnu/patches-mido/0128-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch
