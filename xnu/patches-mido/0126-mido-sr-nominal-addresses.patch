@@ -25,76 +25,125 @@ mapping sits at nominal+slide, dyld reads that base back, still computes a slide
 of 0x3514000, and the first shared-cache pointer it dereferences is 0x3514000
 off.  Zeroing the slide without moving the mapping is worse than doing nothing.
 
-Fix: after zeroing srfmp->slide, subtract it from every sms_address of that file.
+Fix: derive the slide from the addresses (lowest mapping minus the region base,
+which is what sr_first_mapping ends up being) and subtract it from every
+sms_address.  sf_slide cannot be used for this: 0123 already zeroes it in the BSD
+layer before this function runs, which is exactly why 0125 printed slide 0x0.
+
 The region then starts at SHARED_REGION_BASE_ARM64, check_np() returns the
-nominal base, dyld derives slide == 0, and the unreslid contents match.
+nominal base, dyld derives slide == 0, and the unreslid contents match.  The
+print shows both addresses so a boot log proves the arithmetic:
 
-The print now shows both addresses so a boot log proves the arithmetic:
-
-  MIDO SR 0126: noslide, dyld slide 0x3514000 dropped for 1 file(s),
-      63 slid mapping(s); first mapping now 0x180000000 (was 0x183514000)
+  MIDO SR 0126: noslide, slide 0x3514000 removed from 63 mapping(s) in 1
+      file(s); first mapping 0x183514000 -> 0x180000000 (base 0x180000000)
 
 diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
 --- a/osfmk/vm/vm_shared_region.c
 +++ b/osfmk/vm/vm_shared_region.c
-@@ -1968,6 +1968,7 @@
- 	uint32_t                 reported_slide = 0;
- 	uint32_t                 files_with_slide = 0;
+@@ -1961,30 +1961,74 @@
+ 
+ static void
+ mido_sr_drop_slides(
++	vm_shared_region_t        shared_region,
+ 	struct _sr_file_mappings *sr_file_mappings,
+ 	int                      sr_file_mappings_count)
+ {
+ 	struct _sr_file_mappings *srfmp;
+-	uint32_t                 reported_slide = 0;
+-	uint32_t                 files_with_slide = 0;
++	uint64_t                 min_address = ~(uint64_t)0;
++	uint64_t                 region_base = shared_region->sr_base_address;
  	uint32_t                 slid_mappings = 0;
-+	uint32_t                 slide;
++	uint32_t                 files = 0;
++	uint32_t                 slide = 0;
  	unsigned int             i;
  
  	if (!mido_noslide()) {
-@@ -1977,14 +1978,34 @@
+ 		return;
+ 	}
+ 
++	/*
++	 * dyld does not hand us an unslid address and let us add the slide: it
++	 * folds the slide into sms_address itself and passes the slide in
++	 * sf_slide only so that we know how far to relocate the *contents*.
++	 * The lowest mapping is therefore region_base + slide.
++	 *
++	 * Derive the slide from the addresses rather than from sf_slide, because
++	 * 0123 already zeroes sf_slide in the BSD layer on the way in:
++	 *
++	 *   nominal base                    0x180000000
++	 *   dyld's slide                    0x03514000
++	 *   first mapping dyld asks for     0x183514000
++	 *   check_np() with the slide zeroed 0x183514000   <- still slid!
++	 *
++	 * which is why launchd died as soon as it read check_np() and followed a
++	 * shared-cache pointer (0x3514000 too high):
++	 *
++	 *   MIDO SR: launchd check_np -> 0x183514000
++	 *   pid 1 exited -- exit reason namespace 2 subcode 0x0
++	 */
  	for (srfmp = &sr_file_mappings[0];
  	    srfmp < &sr_file_mappings[sr_file_mappings_count];
  	    srfmp++) {
 -		if (srfmp->slide != 0) {
-+		slide = srfmp->slide;
-+		if (slide != 0) {
- 			if (reported_slide == 0) {
+-			if (reported_slide == 0) {
 -				reported_slide = srfmp->slide;
-+				reported_slide = slide;
++		for (i = 0; i < srfmp->mappings_count; i++) {
++			uint64_t addr = srfmp->mappings[i].sms_address;
++
++			if (addr != 0 && addr < min_address) {
++				min_address = addr;
  			}
++		}
++	}
++	if (min_address != ~(uint64_t)0 && min_address > region_base) {
++		slide = (uint32_t)(min_address - region_base);
++	}
++
++	/*
++	 * Pull every mapping back to its nominal address as well, so the region
++	 * starts at SHARED_REGION_BASE_ARM64: check_np() then returns the nominal
++	 * base, dyld derives slide == 0, and the unreslid cache contents match.
++	 */
++	for (srfmp = &sr_file_mappings[0];
++	    srfmp < &sr_file_mappings[sr_file_mappings_count];
++	    srfmp++) {
++		if (srfmp->slide != 0) {
  			srfmp->slide = 0;
- 			files_with_slide++;
+-			files_with_slide++;
++			files++;
  		}
  		for (i = 0; i < srfmp->mappings_count; i++) {
-+			/*
-+			 * dyld already folded the slide into sms_address: it asks for
-+			 * the cache at (nominal + slide) and passes the slide
-+			 * separately so the kernel can relocate the pages.  Dropping
-+			 * the slide alone therefore leaves the cache *moved* but not
-+			 * relocated, and dyld then reads the mapping back through
-+			 * _shared_region_check_np(), still computes a slide of
-+			 * 0x3514000 and dies on the first pointer it follows:
-+			 *
-+			 *   MIDO SR: launchd check_np -> 0x183514000
-+			 *   pid 1 exited -- exit reason namespace 2 subcode 0x0
-+			 *
-+			 * Pull the addresses back to the nominal ones as well, so the
-+			 * region starts at SHARED_REGION_BASE_ARM64 and dyld derives
-+			 * slide == 0 from check_np.
-+			 */
-+			if (slide != 0 && srfmp->mappings[i].sms_address >= slide) {
++			if (slide != 0 &&
++			    srfmp->mappings[i].sms_address >= slide) {
 +				srfmp->mappings[i].sms_address -= slide;
 +			}
  			if (srfmp->mappings[i].sms_max_prot & VM_PROT_SLIDE) {
  				srfmp->mappings[i].sms_max_prot &=
  				    ~VM_PROT_SLIDE;
-@@ -1993,9 +2014,12 @@
+@@ -1993,9 +2037,12 @@
  		}
  	}
  
 -	printf("MIDO SR 0125: noslide, dyld slide 0x%x dropped for %u file(s), "
 -	    "%u slid mapping(s) installed unslid\n",
 -	    reported_slide, files_with_slide, slid_mappings);
-+	printf("MIDO SR 0126: noslide, dyld slide 0x%x dropped for %u file(s), "
-+	    "%u slid mapping(s); first mapping now 0x%llx (was 0x%llx)\n",
-+	    reported_slide, files_with_slide, slid_mappings,
-+	    (unsigned long long)sr_file_mappings[0].mappings[0].sms_address,
-+	    (unsigned long long)(sr_file_mappings[0].mappings[0].sms_address +
-+	    reported_slide));
++	printf("MIDO SR 0126: noslide, slide 0x%x removed from %u mapping(s) in "
++	    "%u file(s); first mapping 0x%llx -> 0x%llx (base 0x%llx)\n",
++	    slide, slid_mappings, files,
++	    (unsigned long long)(min_address),
++	    (unsigned long long)(min_address - slide),
++	    (unsigned long long)region_base);
  }
  
  /*
+@@ -2029,7 +2076,8 @@
+ 	struct shared_file_mapping_slide_np **mappings_to_slide = NULL; /* [0..vmsr_num_slides] */
+ 	struct _sr_file_mappings *srfmp;
+ 
+-	mido_sr_drop_slides(sr_file_mappings, sr_file_mappings_count);
++	mido_sr_drop_slides(shared_region, sr_file_mappings,
++	    sr_file_mappings_count);
+ 
+ 	/*
+ 	 * Figure out how many of the mappings have slides.
