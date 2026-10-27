@@ -481,3 +481,5 @@ jobs:
           git commit -qm "ci: kernel from $GITHUB_SHA"
           git push -f origin HEAD:ci-latest
           echo "published $(shasum -a 256 kernel.development.sweet)"
+
+# 0128 re-run trigger (2026-10-28)
