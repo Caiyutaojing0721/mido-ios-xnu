@@ -1,0 +1,123 @@
+mido: stop dying on a stale block entry in the kernel page tables (0129)
+
+Every boot of this port lands on one of two failure modes:
+
+  PAGE 4       panic: pmap_ttne: Attempt to demote L2 block,
+                       tte=0x00d99d6c0005, target_level=3,
+                       addr=0xfffffff0085xxxxx
+  PAGE 10      kernel boots, launchd dies of SIGSEGV
+                       (exit reason namespace 2 subcode 0xb)
+
+They are the same boot, cut short at two different places.  The panic is not a
+real translation conflict: decode the offending descriptor and it has the block
+type, the access flag clear, and an output address of 0xd99d6c0000, which is
+four times larger than this board's entire RAM.  A descriptor like that cannot
+map anything -- every access through it would fault.  It is stale data that was
+already sitting in a page table page, so whether the boot dies there depends on
+what garbage happened to be in that page this time; the value also differs from
+boot to boot (0xfffffff00852c800 and 0xfffffff0085c000 in the two samples), and
+so does the address that trips over it.
+
+pmap_ttne() treats any block descriptor at an intermediate level as a bug and
+panics.  A release kernel forgives it by falling through to "no table here",
+after which the caller installs a fresh, zeroed translation table over the
+entry.  Do the same in the assert path, but only for descriptors that cannot be
+a mapping (access flag clear); a block with AF set is left to panic, so a real
+translation conflict is still loud.
+
+pmap_expand() also reports what it found, because this is the only place with
+enough context to say which table and which pmap: at most 8 lines, since the
+console ring only holds about 2000.
+
+With this in, the 4-page wall disappears and every boot reaches userspace, where
+0128's MIDO UFAULT report describes the remaining crash.
+--- a/osfmk/arm/pmap/pmap_pt_geometry.h
++++ b/osfmk/arm/pmap/pmap_pt_geometry.h
+@@ -549,6 +549,21 @@
+ 			 * section, so the address in "panic(cpu 0 caller 0x...)" is
+ 			 * useless for symbolication; record the real return address of
+ 			 * this helper instead. */
++			/*
++			 * mido: a block descriptor with the access flag clear cannot
++			 * describe a real mapping -- every access through it faults.
++			 * The entry we keep finding just past the kernel image
++			 * (tte=0x00d99d6c0005 -> PA 0xd99d6c0000, far above this
++			 * board's RAM, AF=0) is stale junk that was already sitting in
++			 * its page table page, and its contents differ from boot to
++			 * boot.  Report it as "no table here" -- which is what a
++			 * release kernel does anyway, because the panic below is
++			 * compiled out -- so the caller installs a fresh, zeroed
++			 * translation table over it instead of dying.
++			 */
++			if ((tte & ARM_TTE_BLOCK_AF) == 0) {
++				return TT_ENTRY_NULL;
++			}
+ 			panic("%s: Attempt to demote L%u block, tte=0x%llx, pmap=%p, "
+ 			    "target_level=%u, addr=%p, from=%p",
+ 			    __func__, cur_level, tte, pmap, target_level, (void*)addr,
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6722,6 +6722,54 @@
+ }
+ 
+ /*
++ * mido: report block descriptors that cannot describe a real mapping.
++ *
++ * pmap_ttne() refuses to walk through a block entry and pmap_expand() then
++ * installs a fresh translation table over it.  This is where we say what was
++ * there: a block with the access flag clear faults on every access, so the
++ * entry is stale junk left in a page table page rather than a mapping.  The
++ * one seen so far sits just past the kernel image (addr 0xfffffff0085xxxxx,
++ * tte=0x00d99d6c0005, output address 0xd99d6c0000, way above this board's
++ * RAM).  Bounded to a handful of lines: the console ring only holds ~2000.
++ */
++static void
++mido_report_junk_blocks(pmap_t pmap, vm_map_address_t v)
++{
++	static uint32_t reports;
++	const pt_attr_t * const pt_attr = pmap_get_pt_attr(pmap);
++	tt_entry_t *table = (tt_entry_t *)pmap->tte;
++	unsigned int level;
++
++	if (reports >= 8) {
++		return;
++	}
++
++	for (level = pt_attr_root_level(pt_attr); level < pt_attr_leaf_level(pt_attr); level++) {
++		tt_entry_t tte = table[ttn_index(pt_attr, v, level)];
++
++		if ((tte & (ARM_TTE_TYPE_MASK | ARM_TTE_VALID)) ==
++		    (ARM_TTE_TYPE_TABLE | ARM_TTE_VALID)) {
++			table = (tt_entry_t *)phystokv(tte & ARM_TTE_TABLE_MASK);
++			continue;
++		}
++		if ((tte & (ARM_TTE_TYPE_MASK | ARM_TTE_VALID)) !=
++		    (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID)) {
++			return;
++		}
++		reports++;
++		printf("MIDO PMAP: L%u %s block tte=0x%llx at addr=%p, "
++		    "table=%p, pmap=%p\n", level,
++		    ((tte & ARM_TTE_BLOCK_AF) == 0) ? "junk (AF clear)" : "live",
++		    tte, (void *)v, (void *)table, pmap);
++		if ((tte & ARM_TTE_BLOCK_AF) != 0) {
++			printf("MIDO PMAP: that one is a real mapping, "
++			    "leaving it alone\n");
++		}
++		return;
++	}
++}
++
++/*
+  *	Routine:	pmap_expand
+  *
+  *	Expands a pmap to be able to map the specified virtual address.
+@@ -6752,6 +6800,8 @@
+ 	pa = 0x0ULL;
+ 	tt_p =  (tt_entry_t *)NULL;
+ 
++	mido_report_junk_blocks(pmap, v);
++
+ 	for (; ttlevel < level; ttlevel++) {
+ 		if (!pmap_lock_preempt(pmap, PMAP_LOCK_SHARED)) {
+ 			return KERN_ABORTED;

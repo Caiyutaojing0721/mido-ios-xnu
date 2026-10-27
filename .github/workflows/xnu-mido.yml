@@ -282,6 +282,14 @@ jobs:
           # fault address, pc/lr/sp and esr from handle_user_abort(), after
           # vm_fault() has failed and before the signal is delivered.
           cp xnu/patches-mido/0128-*.patch dxb/patches/ 2>/dev/null || true
+          # 0129: 0127 named the caller (pmap_expand) but the entry itself is
+          # not a mapping: tte=0x00d99d6c0005 is a block with the access flag
+          # clear and an output address (0xd99d6c0000) four times larger than
+          # the whole RAM.  It is stale data in a page table page, and the two
+          # boot shapes are one boot cut short in two places.  Treat an AF-clear
+          # block as "no table here" (what a release kernel does) instead of
+          # panicking, and report it from pmap_expand().
+          cp xnu/patches-mido/0129-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch
