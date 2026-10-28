@@ -1,0 +1,231 @@
+mido: decode the launchd fault instead of photographing it (0131)
+
+0130 proved the guard is in the kernel -- page 1 of the boot log reads
+"MIDO BUILD 0130 pmap-guard=af10 (literal bit 10)" -- and that boot got all
+the way to ignition without a demote panic.  launchd still died on its first
+unresolvable fault, and this is everything the kernel said about it:
+
+  MIDO UFAULT 1: pid 1 kr 0x1 addr 0x201?1d3462? prot 0x3
+                 pc 0x10112205b lr 0x101122020 sp 0x16f167270
+                 esr 0x9200004?
+
+kr 0x1 is KERN_INVALID_ADDRESS, so vm_fault() found no mapping at all: this
+is not copy-on-write and not a permission problem in the usual sense.  Two
+very different things produce that answer and the VM side cannot tell them
+apart:
+
+  the hardware is right   nothing is mapped at any level, so launchd
+                          computed a wild pointer and the bug is in
+                          userspace
+  the hardware is wrong   a leftover descriptor in a page table page made
+                          the walker believe in a mapping the VM never
+                          created, which is the same stale-table problem
+                          0129 only half closed
+
+The old line cannot distinguish those, and its numbers do not survive a
+photograph: the difference between a translation fault and a permission
+fault lives in the low six bits of the ESR, which is exactly what a blurry
+photo eats.  So print conclusions as well as values:
+
+  MIDO UFAULT 1: pid 1 transl0 kr 0x1 type 0x3 esr 0x92000044
+                 insn 0xf9000120 nent 47
+  MIDO UFAULT: addr 00000000.2011d346 pc 00000001.0112205b ...
+  MIDO WALK: pmap=0x... min=0x0 max=0x... levels 0..3
+  MIDO WALK L0[1] tte=0x...
+  MIDO WALK L1[...] tte=0x...
+
+  * the name comes from fault_status_t, which sleh.c already computes;
+    transl0..3 and perm1..3 are the two cases above
+  * addr/pc/lr/sp are printed as two 32-bit halves, so every token is at
+    most eight digits
+  * insn is the instruction word at pc: it says whether the store is a
+    single register, a pair or an immediate-offset store even though the
+    register values are not printable
+  * the walk prints every level verbatim, so "L2 is not a table pointer"
+    versus "leaf pte present, af=1" is the answer
+
+The build banner moves on as well -- "MIDO BUILD 0131 pmap-guard=af10
+fault-decode" -- so a photo of page 1 still says which kernel produced the
+log.
+
+Bounded to sixteen reports and four walks: a dying launchd takes a dozen
+daemons with it and the console ring holds about 2000 lines.
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6743,7 +6743,7 @@ mido_report_junk_blocks(pmap_t pmap, vm_map_address_t v)
+ 
+ 	if (bannered == 0) {
+ 		bannered = 1;
+-		printf("MIDO BUILD 0130 pmap-guard=af10 (literal bit 10)\n");
++		printf("MIDO BUILD 0131 pmap-guard=af10 fault-decode\n");
+ 	}
+ 
+ 	if (reports >= 8) {
+@@ -6858,6 +6858,75 @@ pmap_expand(
+ 	return KERN_SUCCESS;
+ }
+ 
++/*
++ * mido: dump the page table walk for an address whose fault the VM refused.
++ *
++ * The report from handle_user_abort() says only that vm_fault() gave up.  It
++ * cannot say which of two things happened:
++ *
++ *   the hardware is right   nothing is mapped here at any level, so the
++ *                           program computed a wild pointer
++ *   the hardware is wrong   a descriptor left over from an earlier life of
++ *                           this page table made the walker believe in a
++ *                           mapping the VM has never heard of
++ *
++ * They need opposite fixes, and the difference is visible exactly one way:
++ * walk the tables and print what each level holds.  The first level that is
++ * not a table pointer, and the value it holds, is the answer.
++ *
++ * Bounded to a few reports: a dying launchd takes a dozen daemons with it and
++ * the console ring only holds about 2000 lines.
++ */
++void
++mido_walk_report(
++	void                    *pmap_arg,
++	unsigned long long       v_arg)
++{
++	static uint32_t reports;
++	pmap_t pmap = (pmap_t)pmap_arg;
++	vm_map_address_t v = (vm_map_address_t)v_arg;
++	const pt_attr_t * const pt_attr = pmap_get_pt_attr(pmap);
++	tt_entry_t *table = (tt_entry_t *)pmap->tte;
++	unsigned int root_level = pt_attr_root_level(pt_attr);
++	unsigned int leaf_level = pt_attr_leaf_level(pt_attr);
++	unsigned int level;
++
++	if (reports >= 4) {
++		return;
++	}
++	reports++;
++
++	printf("MIDO WALK: pmap=%p min=0x%llx max=0x%llx levels %u..%u\n",
++	    pmap, (unsigned long long)pmap->min,
++	    (unsigned long long)pmap->max, root_level, leaf_level);
++
++	if (table == NULL) {
++		printf("MIDO WALK: no root table\n");
++		return;
++	}
++
++	for (level = root_level; level <= leaf_level; level++) {
++		unsigned int idx = (unsigned int)ttn_index(pt_attr, v, level);
++		tt_entry_t tte = table[idx];
++
++		if (level == leaf_level) {
++			printf("MIDO WALK L%u[%u] leaf pte=0x%llx af=%llu\n",
++			    level, idx, (unsigned long long)tte,
++			    (unsigned long long)((tte >> 10) & 1));
++			return;
++		}
++		printf("MIDO WALK L%u[%u] tte=0x%llx\n", level, idx,
++		    (unsigned long long)tte);
++		if ((tte & (ARM_TTE_TYPE_MASK | ARM_TTE_VALID)) !=
++		    (ARM_TTE_TYPE_TABLE | ARM_TTE_VALID)) {
++			printf("MIDO WALK: L%u is not a table pointer, "
++			    "walk ends here\n", level);
++			return;
++		}
++		table = (tt_entry_t *)phystokv(tte & ARM_TTE_TABLE_MASK);
++	}
++}
++
+ /*
+  *	Routine:	pmap_gc
+  *	Function:
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1353,6 +1353,48 @@ handle_sw_step_debug(arm_saved_state_t *state)
+ 	__builtin_unreachable();
+ }
+ 
++/*
++ * mido: name the fault the way the ARM ARM does.
++ *
++ * A photographed console cannot resolve an eight-digit ESR reliably, and the
++ * bit that matters here lives in the low six bits: "translation fault, level
++ * 0" means nothing is mapped and the program used a wild pointer, while
++ * "permission fault, level 3" means a translation exists but does not allow
++ * the access.  Those two need opposite fixes, so say which one it is in words
++ * rather than leaving it to a photograph.
++ */
++static const char *
++mido_fault_code_name(fault_status_t code)
++{
++	switch (code) {
++	case FSC_TRANSLATION_FAULT_L0:
++		return "transl0";
++	case FSC_TRANSLATION_FAULT_L1:
++		return "transl1";
++	case FSC_TRANSLATION_FAULT_L2:
++		return "transl2";
++	case FSC_TRANSLATION_FAULT_L3:
++		return "transl3";
++	case FSC_PERMISSION_FAULT_L1:
++		return "perm1";
++	case FSC_PERMISSION_FAULT_L2:
++		return "perm2";
++	case FSC_PERMISSION_FAULT_L3:
++		return "perm3";
++	case FSC_ACCESS_FLAG_FAULT_L1:
++		return "afault1";
++	case FSC_ACCESS_FLAG_FAULT_L2:
++		return "afault2";
++	case FSC_ACCESS_FLAG_FAULT_L3:
++		return "afault3";
++	default:
++		return "other";
++	}
++}
++
++/* in osfmk/arm/pmap/pmap.c */
++extern void mido_walk_report(void *pmap, unsigned long long v);
++
+ static void
+ handle_user_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_addr,
+     fault_status_t fault_code, vm_prot_t fault_type, expected_fault_handler_t expected_fault_handler)
+@@ -1423,16 +1465,32 @@ handle_user_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_addr
+ 		{
+ 			static unsigned int mido_ufault_reports;
+ 
+-			if (mido_ufault_reports < 64) {
++			if (mido_ufault_reports < 16) {
++				uint32_t insn = 0;
++				uint64_t pc;
++				uint64_t lr;
++				uint64_t sp;
++
+ 				mido_ufault_reports++;
+-				kprintf("MIDO UFAULT %u: pid %d kr 0x%x addr 0x%llx "
+-				    "prot 0x%x pc 0x%llx lr 0x%llx sp 0x%llx esr 0x%x\n",
++				pc = get_saved_state_pc(state);
++				lr = get_saved_state_lr(state);
++				sp = get_saved_state_sp(state);
++				COPYIN(pc, (char *)&insn, sizeof(insn));
++
++				kprintf("MIDO UFAULT %u: pid %d %s kr 0x%x type 0x%x "
++				    "esr 0x%x insn 0x%x nent %u\n",
+ 				    mido_ufault_reports, task_pid(current_task()),
+-				    result, (unsigned long long)vm_fault_addr,
+-				    fault_type,
+-				    (unsigned long long)get_saved_state_pc(state),
+-				    (unsigned long long)get_saved_state_lr(state),
+-				    (unsigned long long)get_saved_state_sp(state), esr);
++				    mido_fault_code_name(fault_code), result,
++				    (unsigned int)fault_type, esr, insn,
++				    (unsigned int)map->hdr.nentries);
++				kprintf("MIDO UFAULT: addr %08x.%08x pc %08x.%08x "
++				    "lr %08x.%08x sp %08x.%08x\n",
++				    (uint32_t)(vm_fault_addr >> 32),
++				    (uint32_t)vm_fault_addr,
++				    (uint32_t)(pc >> 32), (uint32_t)pc,
++				    (uint32_t)(lr >> 32), (uint32_t)lr,
++				    (uint32_t)(sp >> 32), (uint32_t)sp);
++				mido_walk_report((void *)map->pmap, vm_fault_addr);
+ 			}
+ 		}
+ 

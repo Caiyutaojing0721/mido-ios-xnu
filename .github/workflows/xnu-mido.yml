@@ -290,6 +290,16 @@ jobs:
           # block as "no table here" (what a release kernel does) instead of
           # panicking, and report it from pmap_expand().
           cp xnu/patches-mido/0129-*.patch dxb/patches/ 2>/dev/null || true
+          # 0131: 0130 proved the pmap guard is live and that boot reached
+          # ignition, but launchd still died on its first unresolvable fault
+          # with kr 0x1 (KERN_INVALID_ADDRESS) at 0x201?1d3462?, pc
+          # 0x10112205b -- and neither the ESR low bits nor an eight-digit
+          # address survives being photographed.  Print the fault status by
+          # name (transl0..3 / perm1..3), print addr/pc/lr/sp as two 32-bit
+          # halves, print the instruction word at pc, and walk the four page
+          # table levels for the address so "no table pointer at L2" and
+          # "leaf pte present" can be told apart.
+          cp xnu/patches-mido/0131-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch
