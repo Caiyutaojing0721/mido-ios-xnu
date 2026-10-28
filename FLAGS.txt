@@ -1,0 +1,2 @@
+-mcpu=cortex-a53+crypto -min=14.0 
+64:MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a53+crypto

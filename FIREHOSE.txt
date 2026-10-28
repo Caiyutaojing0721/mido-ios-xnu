@@ -1,0 +1,8 @@
+archive: dxb/fakeroot/usr/local/lib/kernel/libfirehose_kernel.a
+architecture x86_64
+    cputype CPU_TYPE_X86_64
+    align 2^3 (8)
+architecture arm64
+    cputype CPU_TYPE_ARM64
+    align 2^3 (8)
+dxb/build/libfirehose_kernel.obj/libdispatch.build/Release/libfirehose_kernel.build
