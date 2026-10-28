@@ -10,13 +10,15 @@ Every boot of this port lands on one of two failure modes:
 
 They are the same boot, cut short at two different places.  The panic is not a
 real translation conflict: decode the offending descriptor and it has the block
-type, the access flag clear, and an output address of 0xd99d6c0000, which is
-four times larger than this board's entire RAM.  A descriptor like that cannot
-map anything -- every access through it would fault.  It is stale data that was
+type, the access flag clear, and an output address of 0xd99d6c0000 that is four
+times larger than this board's entire RAM.  A descriptor like that cannot map
+anything -- every access through it would fault.  It is stale data that was
 already sitting in a page table page, so whether the boot dies there depends on
-what garbage happened to be in that page this time; the value also differs from
-boot to boot (0xfffffff00852c800 and 0xfffffff0085c000 in the two samples), and
-so does the address that trips over it.
+what garbage happened to be in that page this time.  The value differs from boot
+to boot, and so does the address that trips over it:
+
+  tte=0x00d99d6c0005  addr=0xfffffff00852c800 / 0xfffffff0085c000
+  tte=0x0000000000000005  addr=0xfffffff008071000
 
 pmap_ttne() treats any block descriptor at an intermediate level as a bug and
 panics.  A release kernel forgives it by falling through to "no table here",
@@ -25,31 +27,37 @@ entry.  Do the same in the assert path, but only for descriptors that cannot be
 a mapping (access flag clear); a block with AF set is left to panic, so a real
 translation conflict is still loud.
 
+The access flag is bit 10 of a block or page descriptor in the ARMv8
+long-descriptor format.  The first cut of this patch tested the ARM_TTE_BLOCK_AF
+macro instead, and a boot still panicked with tte=0x5 -- a descriptor whose bit
+10 is clear -- so the macro in this tree does not name bit 10.  Test the bit
+itself; there is no ambiguity left.
+
 pmap_expand() also reports what it found, because this is the only place with
 enough context to say which table and which pmap: at most 8 lines, since the
-console ring only holds about 2000.
-
-With this in, the 4-page wall disappears and every boot reaches userspace, where
-0128's MIDO UFAULT report describes the remaining crash.
+console ring only holds about 2000.  The first call also prints a build banner,
+so a photographed console says which kernel produced it.
 --- a/osfmk/arm/pmap/pmap_pt_geometry.h
 +++ b/osfmk/arm/pmap/pmap_pt_geometry.h
-@@ -549,6 +549,21 @@
+@@ -549,6 +549,23 @@
  			 * section, so the address in "panic(cpu 0 caller 0x...)" is
  			 * useless for symbolication; record the real return address of
  			 * this helper instead. */
 +			/*
 +			 * mido: a block descriptor with the access flag clear cannot
 +			 * describe a real mapping -- every access through it faults.
-+			 * The entry we keep finding just past the kernel image
-+			 * (tte=0x00d99d6c0005 -> PA 0xd99d6c0000, far above this
-+			 * board's RAM, AF=0) is stale junk that was already sitting in
-+			 * its page table page, and its contents differ from boot to
-+			 * boot.  Report it as "no table here" -- which is what a
-+			 * release kernel does anyway, because the panic below is
-+			 * compiled out -- so the caller installs a fresh, zeroed
-+			 * translation table over it instead of dying.
++			 * Samples so far: tte=0x00d99d6c0005 (PA 0xd99d6c0000, far
++			 * above this board's RAM) and tte=0x5 (PA 0).  AF is bit 10
++			 * of a block or page descriptor in the ARMv8 long-descriptor
++			 * format (D8.3/D5.3.2), so test that bit directly.  The first
++			 * cut used ARM_TTE_BLOCK_AF and still panicked with tte=0x5,
++			 * so that macro does not name bit 10 here.  Report it as "no
++			 * table here" -- which is what a release kernel does anyway,
++			 * because the panic below is compiled out -- so the caller
++			 * installs a fresh, zeroed translation table over it instead
++			 * of dying.
 +			 */
-+			if ((tte & ARM_TTE_BLOCK_AF) == 0) {
++			if ((tte & (1ULL << 10)) == 0) {
 +				return TT_ENTRY_NULL;
 +			}
  			panic("%s: Attempt to demote L%u block, tte=0x%llx, pmap=%p, "
@@ -57,7 +65,7 @@ With this in, the 4-page wall disappears and every boot reaches userspace, where
  			    __func__, cur_level, tte, pmap, target_level, (void*)addr,
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
-@@ -6722,6 +6722,54 @@
+@@ -6722,6 +6722,60 @@
  }
  
  /*
@@ -66,18 +74,24 @@ With this in, the 4-page wall disappears and every boot reaches userspace, where
 + * pmap_ttne() refuses to walk through a block entry and pmap_expand() then
 + * installs a fresh translation table over it.  This is where we say what was
 + * there: a block with the access flag clear faults on every access, so the
-+ * entry is stale junk left in a page table page rather than a mapping.  The
-+ * one seen so far sits just past the kernel image (addr 0xfffffff0085xxxxx,
-+ * tte=0x00d99d6c0005, output address 0xd99d6c0000, way above this board's
-+ * RAM).  Bounded to a handful of lines: the console ring only holds ~2000.
++ * entry is stale junk left in a page table page rather than a mapping.  Seen
++ * so far at 0xfffffff0085xxxxx (tte=0x00d99d6c0005) and 0xfffffff008071000
++ * (tte=0x5), both just past the kernel image.  Bounded to a handful of lines:
++ * the console ring only holds ~2000.
 + */
 +static void
 +mido_report_junk_blocks(pmap_t pmap, vm_map_address_t v)
 +{
 +	static uint32_t reports;
++	static uint32_t bannered;
 +	const pt_attr_t * const pt_attr = pmap_get_pt_attr(pmap);
 +	tt_entry_t *table = (tt_entry_t *)pmap->tte;
 +	unsigned int level;
++
++	if (bannered == 0) {
++		bannered = 1;
++		printf("MIDO BUILD 0130 pmap-guard=af10 (literal bit 10)\n");
++	}
 +
 +	if (reports >= 8) {
 +		return;
@@ -98,9 +112,9 @@ With this in, the 4-page wall disappears and every boot reaches userspace, where
 +		reports++;
 +		printf("MIDO PMAP: L%u %s block tte=0x%llx at addr=%p, "
 +		    "table=%p, pmap=%p\n", level,
-+		    ((tte & ARM_TTE_BLOCK_AF) == 0) ? "junk (AF clear)" : "live",
++		    ((tte & (1ULL << 10)) == 0) ? "junk (AF clear)" : "live",
 +		    tte, (void *)v, (void *)table, pmap);
-+		if ((tte & ARM_TTE_BLOCK_AF) != 0) {
++		if ((tte & (1ULL << 10)) != 0) {
 +			printf("MIDO PMAP: that one is a real mapping, "
 +			    "leaving it alone\n");
 +		}
@@ -112,7 +126,7 @@ With this in, the 4-page wall disappears and every boot reaches userspace, where
   *	Routine:	pmap_expand
   *
   *	Expands a pmap to be able to map the specified virtual address.
-@@ -6752,6 +6800,8 @@
+@@ -6752,6 +6805,8 @@
  	pa = 0x0ULL;
  	tt_p =  (tt_entry_t *)NULL;
  
