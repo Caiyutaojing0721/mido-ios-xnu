@@ -1,0 +1,145 @@
+mido: dump the address space around the launchd fault, and stop the walk lying
+
+0131 named the fault (transl0) and printed the walk, and the two disagreed in a
+way that cannot both be true: vm_fault() returned KERN_INVALID_ADDRESS, yet the
+walk reported a leaf pte with af=1.  The walk is the liar.  It computed indices
+from an address of 0x201e1d34620, which is far outside the pmap it was walking
+(max 0x8000000000), so it read whatever descriptor happened to sit at the
+truncated index and printed it as if it described the fault.  Skip the walk
+when the address is outside [min, max) and say so.
+
+The instruction word is the one hard fact from the last boot:
+
+	insn 0xb9000149          str w9, [x10]
+	addr 0x201e1d34620
+	x86_64 launchd __TEXT is 0x100000000-0x100068000, and 0xb9000149
+	appears nowhere in it
+
+so before guessing where the instruction lives, ask the map.  Print every entry
+of the faulting task's map (capped at twenty), then say which entry holds pc and
+whether the low 32 bits of the faulting address are mapped.  Those three answers
+separate the remaining hypotheses:
+
+  pc in an entry under 0x180000000   the store came from a real image, and the
+                                     offset inside it names the function
+  low32 mapped                       the pointer was assembled from the wrong
+                                     halves when it was read as 64 bits
+  low32 also unmapped                the pointer is simply garbage
+
+Also print x0..x15: the register that fed x10 is very likely still live in
+x0..x9, and a register dump costs four lines.
+
+Banner becomes "MIDO BUILD 0132 pmap-guard=af10 map-dump".
+index 5a8a03f..4fdceec 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6900,6 +6900,14 @@ mido_walk_report(
+ 	    pmap, (unsigned long long)pmap->min,
+ 	    (unsigned long long)pmap->max, root_level, leaf_level);
+ 
++	if (v < pmap->min || v >= pmap->max) {
++		printf("MIDO WALK: 0x%llx is outside pmap 0x%llx-0x%llx, "
++		    "no walk\n", (unsigned long long)v,
++		    (unsigned long long)pmap->min,
++		    (unsigned long long)pmap->max);
++		return;
++	}
++
+ 	if (table == NULL) {
+ 		printf("MIDO WALK: no root table\n");
+ 		return;
+index 1a85ad1..9db00e4 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1395,6 +1395,65 @@ mido_fault_code_name(fault_status_t code)
+ /* in osfmk/arm/pmap/pmap.c */
+ extern void mido_walk_report(void *pmap, unsigned long long v);
+ 
++/*
++ * mido: print the address space around a fault the VM refused.
++ *
++ * Two facts decide where to look next, and neither is visible in a photograph
++ * of the registers alone:
++ *
++ *   which entry holds pc        that names the image the instruction came from
++ *   whether the low 32 bits     if the low half is mapped somewhere sane, the
++ *   of the address are mapped   pointer was assembled from the wrong halves and
++ *                               the bug is in whoever read it as 64 bits; if it
++ *                               is not mapped either, the pointer is garbage
++ *
++ * Entries are capped at twenty and printed as 32-bit halves so every token
++ * survives a photograph.
++ */
++static void
++mido_map_report(vm_map_t map, uint64_t pc, uint64_t fault_addr)
++{
++	vm_map_entry_t entry;
++	unsigned int i = 0;
++
++	kprintf("MIDO MAP: %u entries\n", map->hdr.nentries);
++	for (entry = vm_map_first_entry(map);
++	    entry != vm_map_to_entry(map) && i < 20;
++	    entry = entry->vme_next, i++) {
++		kprintf("MIDO MAP %u: %08x.%08x-%08x.%08x p%x\n", i,
++		    (uint32_t)(entry->vme_start >> 32),
++		    (uint32_t)entry->vme_start,
++		    (uint32_t)(entry->vme_end >> 32),
++		    (uint32_t)entry->vme_end,
++		    (unsigned int)entry->protection);
++	}
++	if (vm_map_lookup_entry(map, pc, &entry)) {
++		kprintf("MIDO MAP: pc %08x.%08x in %08x.%08x-%08x.%08x p%x\n",
++		    (uint32_t)(pc >> 32), (uint32_t)pc,
++		    (uint32_t)(entry->vme_start >> 32),
++		    (uint32_t)entry->vme_start,
++		    (uint32_t)(entry->vme_end >> 32),
++		    (uint32_t)entry->vme_end,
++		    (unsigned int)entry->protection);
++	} else {
++		kprintf("MIDO MAP: pc %08x.%08x in no entry\n",
++		    (uint32_t)(pc >> 32), (uint32_t)pc);
++	}
++	if (fault_addr > 0xffffffffULL &&
++	    vm_map_lookup_entry(map, (vm_map_offset_t)(uint32_t)fault_addr,
++	    &entry)) {
++		kprintf("MIDO MAP: low32 %08x in %08x.%08x-%08x.%08x p%x\n",
++		    (uint32_t)fault_addr,
++		    (uint32_t)(entry->vme_start >> 32),
++		    (uint32_t)entry->vme_start,
++		    (uint32_t)(entry->vme_end >> 32),
++		    (uint32_t)entry->vme_end,
++		    (unsigned int)entry->protection);
++	} else {
++		kprintf("MIDO MAP: low32 %08x unmapped\n", (uint32_t)fault_addr);
++	}
++}
++
+ static void
+ handle_user_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_addr,
+     fault_status_t fault_code, vm_prot_t fault_type, expected_fault_handler_t expected_fault_handler)
+@@ -1490,6 +1549,25 @@ handle_user_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_addr
+ 				    (uint32_t)(pc >> 32), (uint32_t)pc,
+ 				    (uint32_t)(lr >> 32), (uint32_t)lr,
+ 				    (uint32_t)(sp >> 32), (uint32_t)sp);
++				mido_map_report(map, pc, vm_fault_addr);
++				{
++					unsigned int r;
++
++					for (r = 0; r < 16; r += 4) {
++						uint64_t a = get_saved_state_reg(state, r);
++						uint64_t b = get_saved_state_reg(state, r + 1);
++						uint64_t c = get_saved_state_reg(state, r + 2);
++						uint64_t d = get_saved_state_reg(state, r + 3);
++
++						kprintf("MIDO REGS x%u: %08x.%08x "
++						    "%08x.%08x %08x.%08x %08x.%08x\n",
++						    r,
++						    (uint32_t)(a >> 32), (uint32_t)a,
++						    (uint32_t)(b >> 32), (uint32_t)b,
++						    (uint32_t)(c >> 32), (uint32_t)c,
++						    (uint32_t)(d >> 32), (uint32_t)d);
++					}
++				}
+ 				mido_walk_report((void *)map->pmap, vm_fault_addr);
+ 			}
+ 		}
