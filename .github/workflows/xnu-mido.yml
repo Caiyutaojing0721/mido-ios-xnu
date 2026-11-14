@@ -329,11 +329,15 @@ jobs:
           # for plain arm64 only, and pin the ISA with -mcpu as well (the
           # xcconfig's OTHER_CFLAGS is a plain assignment, so the exact value
           # has to be repeated here or -mkernel would be lost).
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64" VALID_ARCHS="x86_64 arm64"/' dxb/build.sh
+          # Xcode 16's clang rejects -mcpu for an x86_64 target ("unsupported
+          # option -mcpu= for target x86_64-apple-macos15.0"), and OTHER_CFLAGS
+          # cannot be varied per architecture, so drop the x86_64 slice instead
+          # of carrying it along.  The kernel links the arm64 slice anyway.
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64"/' dxb/build.sh
           sed -i '' 's|xcodebuild install -target libfirehose_kernel |xcodebuild install -target libfirehose_kernel OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53+crypto" |' dxb/build.sh
           # A sed that silently does not match would otherwise ship the same
           # broken archive again, and only the finished kernel would show it.
-          grep -q 'ARCHS="x86_64 arm64" VALID_ARCHS="x86_64 arm64"' dxb/build.sh \
+          grep -q 'ARCHS="arm64" VALID_ARCHS="arm64"' dxb/build.sh \
             || { echo "::error::could not narrow libfirehose_kernel to arm64"; exit 1; }
           grep -q 'OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53+crypto"' dxb/build.sh \
             || { echo "::error::could not pin libfirehose_kernel to cortex-a53"; exit 1; }
