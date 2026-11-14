@@ -3229,6 +3229,7 @@ mido_gcc_enable_clocks(void)
 	return 0;
 }
 
+int
 mido_sdhci_init(void)
 {
 	DTEntry node;
