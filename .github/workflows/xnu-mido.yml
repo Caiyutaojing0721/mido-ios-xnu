@@ -47,11 +47,14 @@ env:
 
 jobs:
   build:
-    # macos-13 is the last Intel image that still ships Xcode 15.x, whose iig
-    # matches the xnu-8796 IORPC ABI (Xcode 16 emits IORPC.kernelContent, which
-    # this xnu lacks).  macos-14 now resolves to an arm64 configuration that
-    # this account cannot use: "macos-14-arm64-us-default is not supported".
-    runs-on: macos-13
+    # macos-15-intel is the only Intel label GitHub still hosts (macos-13 and
+    # macos-14 are retired; plain macos-14 now resolves to an arm64
+    # configuration this account cannot use: "macos-14-arm64-us-default is not
+    # supported", and a macos-13 job queues forever).  The Xcode selection step
+    # below picks the oldest installed Xcode, which needs to be 15.x: its iig
+    # matches the xnu-8796 IORPC ABI, while Xcode 16 emits IORPC.kernelContent
+    # that this xnu does not have.
+    runs-on: macos-15-intel
     timeout-minutes: 120
     # the kernel is pushed back to the ci-latest branch so the machine doing the
     # packaging can fetch it without a GitHub login (artifacts need one)
