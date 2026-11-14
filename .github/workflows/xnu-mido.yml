@@ -502,3 +502,5 @@ jobs:
           echo "published $(shasum -a 256 kernel.development.sweet)"
 
 # 0128 re-run trigger (2026-10-28)
+# 0132 re-run trigger (2026-11-14): the db62c6c run was cancelled two seconds
+# after it started, before any step ran, so nothing was built from it.
