@@ -514,3 +514,5 @@ jobs:
 # 0128 re-run trigger (2026-10-28)
 # 0132 re-run trigger (2026-11-14): the db62c6c run was cancelled two seconds
 # after it started, before any step ran, so nothing was built from it.
+
+# 0143 re-trigger (2026-11-15): the fbf6968 push produced no run at all.
