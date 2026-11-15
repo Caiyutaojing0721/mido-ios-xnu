@@ -1,0 +1,47 @@
+mido: never panic on a block descriptor, install a table instead (0144)
+
+0143 put the console log on the eMMC, and the very next boot came up as the
+short form again: four pages and a stop, before the eMMC driver is up, so the
+log that was supposed to make this visible never reached the disk.  The short
+form is the pmap_ttne() demote panic, and 0129 only forgave descriptors with the
+access flag clear.  This boot's descriptor evidently had AF set, so it fell
+through to the panic.
+
+The panic itself is the bug, not the descriptor.  It lives inside
+#if MACH_ASSERT, so a release kernel walks straight past it and lets
+pmap_expand() install a fresh zeroed table over the entry -- which is why the
+same image boots to launchd most of the time.  The only reason the short form
+exists at all is that this is a DEVELOPMENT build with asserts compiled in.
+
+So do what the release path does, unconditionally: say what was there and
+return "no table".  Losing the panic costs nothing that 0129's guard did not
+already cost -- a genuinely conflicting block descriptor would have to come
+from arm_vm_init's static mappings, which never go through pmap_ttne() for a
+level it would demote -- and it buys the one thing this bring-up needs: every
+boot reaches the eMMC driver, so every boot leaves a log behind.
+--- a/osfmk/arm/pmap/pmap_pt_geometry.h
++++ b/osfmk/arm/pmap/pmap_pt_geometry.h
+@@ -566,10 +566,19 @@
+ 			if ((tte & (1ULL << 10)) == 0) {
+ 				return TT_ENTRY_NULL;
+ 			}
+-			panic("%s: Attempt to demote L%u block, tte=0x%llx, pmap=%p, "
+-			    "target_level=%u, addr=%p, from=%p",
+-			    __func__, cur_level, tte, pmap, target_level, (void*)addr,
+-			    __builtin_return_address(0));
++			/*
++			 * mido: report and carry on.  This panic is inside MACH_ASSERT,
++			 * so a release kernel already walks past it and lets pmap_expand()
++			 * install a fresh, zeroed table over the entry -- and the same
++			 * image boots to launchd most of the time for exactly that
++			 * reason.  Keeping the panic only guarantees that some boots stop
++			 * before the eMMC driver exists, which also means they leave no
++			 * log behind to say why.  Do the release thing unconditionally and
++			 * say what was there first.
++			 */
++			printf("MIDO PMAP: L%u block tte=0x%llx pmap=%p addr=%p, "
++			    "no table here\n", cur_level, tte, pmap, (void *)addr);
++			return TT_ENTRY_NULL;
+ 		}
+ #endif
+ 		if ((tte & (ARM_TTE_TYPE_MASK | ARM_TTE_VALID)) != (ARM_TTE_TYPE_TABLE | ARM_TTE_VALID)) {

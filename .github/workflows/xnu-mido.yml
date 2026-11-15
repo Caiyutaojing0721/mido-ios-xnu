@@ -307,6 +307,7 @@ jobs:
           cp xnu/patches-mido/0131-*.patch dxb/patches/ 2>/dev/null || true
           cp xnu/patches-mido/0132-*.patch dxb/patches/ 2>/dev/null || true
           cp xnu/patches-mido/0143-*.patch dxb/patches/ 2>/dev/null || true
+          cp xnu/patches-mido/0144-*.patch dxb/patches/ 2>/dev/null || true
           # The ARMv8.0 baseline lives in xnu/patches/0004-*, which is the patch
           # that creates MACHINE_FLAGS_ARM64_SWEET in the first place.  Doing it
           # here with a later patch did not work: dxb only warns when a patch
