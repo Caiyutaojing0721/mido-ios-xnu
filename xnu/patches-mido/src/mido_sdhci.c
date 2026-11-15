@@ -3229,6 +3229,128 @@ mido_gcc_enable_clocks(void)
 	return 0;
 }
 
+/* ---------------------------------------------- persistent console log */
+/*
+ * mido: copy the sweetlog ring to the SYSTEM partition once a second.
+ *
+ * Every character that reaches the console already lands in the 4 MiB ring in
+ * bsd/dev/sweet_ufs.c, but that file's flusher never runs on mido because this
+ * board has no UFS.  Without a flusher the only way to read a boot is to film
+ * the screen, which is exactly what this thread exists to stop.
+ *
+ * The area is the 8193 sectors reserved at the start of "system" (see
+ * MIDO_LOG_SYSTEM_BLOCKS and mido_sdhci_find_partition), so the log can never
+ * touch a filesystem and a recovery can read it back with a single dd:
+ *
+ *   header : "MIDOLOG" | u32 version | u32 ring size | u64 total | u64 seq
+ *            at SYSTEM sector 0
+ *   ring   : console byte n lives at ring offset n % ring size, ring block b
+ *            lives at SYSTEM sector 1 + b
+ *
+ * header.total is how many bytes have been written since boot, which is what
+ * tools/mido-log-pull.py needs to unroll the ring.
+ *
+ * Disabled with boot-arg mido_log=0.  A write error stops the thread instead of
+ * retrying: the only reachable causes are a dead card or a partition that moved,
+ * and both make a retry pointless.
+ */
+#define MIDO_LOG_RING_SIZE      (4u << 20)
+#define MIDO_LOG_BLOCK          SDHCI_BLOCK
+#define MIDO_LOG_RING_BLOCKS    (MIDO_LOG_RING_SIZE / MIDO_LOG_BLOCK)
+#define MIDO_LOG_MAX_WRITE      64u     /* 32 KiB per write */
+
+struct mido_log_header {
+	char     magic[8];
+	uint32_t version;
+	uint32_t size;
+	uint64_t total;
+	uint64_t seq;
+};
+
+extern char *sweet_log_ring_base(void);         /* bsd/dev/sweet_ufs.c */
+extern uint64_t sweet_log_bytes(void);          /* bsd/dev/sweet_ufs.c */
+extern int hz;
+extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+extern void thread_deallocate(thread_t);
+
+static int mido_log_chan;
+
+void mido_log_start(void);
+
+static void
+mido_log_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	uint64_t base = se.sys_first_block;
+	uint64_t flushed = 0, seq = 0;
+	const char *ring = sweet_log_ring_base();
+
+	printf("MIDO LOG: console log to SYSTEM sector 0x%llx, %u KiB ring\n",
+	    (unsigned long long)base, MIDO_LOG_RING_SIZE >> 10);
+	for (;;) {
+		uint64_t total, pos;
+		int error = 0;
+
+		(void)tsleep(&mido_log_chan, PZERO, "midolog", hz);
+		total = sweet_log_bytes();
+		if (total == flushed) {
+			continue;
+		}
+
+		/* Never replay more than one ring, and start on a block edge. */
+		pos = (total - flushed >= MIDO_LOG_RING_SIZE) ?
+		    total - MIDO_LOG_RING_SIZE : flushed;
+		pos &= ~(uint64_t)(MIDO_LOG_BLOCK - 1);
+
+		while (pos < total && !error) {
+			uint32_t blk = (uint32_t)((pos / MIDO_LOG_BLOCK) %
+			    MIDO_LOG_RING_BLOCKS);
+			uint64_t want = (total - pos + MIDO_LOG_BLOCK - 1) /
+			    MIDO_LOG_BLOCK;
+			uint32_t n = (uint32_t)MIN(want,
+			    (uint64_t)(MIDO_LOG_RING_BLOCKS - blk));
+
+			n = (uint32_t)MIN((uint64_t)n,
+			    (uint64_t)MIDO_LOG_MAX_WRITE);
+			error = mido_sdhci_write_log_blocks(base + 1 + blk, n,
+			    ring + (uint64_t)blk * MIDO_LOG_BLOCK);
+			if (!error) {
+				pos += (uint64_t)n * MIDO_LOG_BLOCK;
+			}
+		}
+		if (!error) {
+			struct mido_log_header h;
+
+			bzero(&h, sizeof(h));
+			memcpy(h.magic, "MIDOLOG", 8);
+			h.version = 1;
+			h.size = MIDO_LOG_RING_SIZE;
+			h.total = total;
+			h.seq = ++seq;
+			error = mido_sdhci_write_log_blocks(base, 1, &h);
+		}
+		if (error) {
+			printf("MIDO LOG: write failed (%d), stopping\n", error);
+			return;
+		}
+		flushed = total;
+	}
+}
+
+void
+mido_log_start(void)
+{
+	uint32_t on = 1;
+	thread_t thread;
+
+	PE_parse_boot_argn("mido_log", &on, sizeof(on));
+	if (!on || !se.log_ok || se.sys_first_block == 0) {
+		return;
+	}
+	if (kernel_thread_start(mido_log_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
 int
 mido_sdhci_init(void)
 {
@@ -3335,6 +3457,7 @@ mido_sdhci_init(void)
 	    se.part, (unsigned long long)se.first_block,
 	    (unsigned long long)(se.nblocks * SDHCI_BLOCK >> 20),
 	    se.writable ? "writable (emmcrw=1)" : "read-only");
+	mido_log_start();
 	return 0;
 }
 
