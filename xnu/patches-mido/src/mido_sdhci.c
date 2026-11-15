@@ -3231,33 +3231,36 @@ mido_gcc_enable_clocks(void)
 
 /* ---------------------------------------------- persistent console log */
 /*
- * mido: copy the sweetlog ring to the SYSTEM partition once a second.
+ * mido: copy the sweetlog ring to the SYSTEM partition as the console grows.
  *
- * Every character that reaches the console already lands in the 4 MiB ring in
- * bsd/dev/sweet_ufs.c, but that file's flusher never runs on mido because this
- * board has no UFS.  Without a flusher the only way to read a boot is to film
- * the screen, which is exactly what this thread exists to stop.
+ * Every character that reaches the console lands in the 4 MiB ring in
+ * bsd/dev/sweet_ufs.c, but that file's flusher runs in a kernel thread that
+ * only starts on UFS hardware.  A thread is the wrong tool here: mido_sdhci_init
+ * runs from IOKitBSDInit, long before the thread subsystem is usable, so
+ * kernel_thread_start() failed silently and the ring was thrown away at reset.
  *
- * The area is the 8193 sectors reserved at the start of "system" (see
- * MIDO_LOG_SYSTEM_BLOCKS and mido_sdhci_find_partition), so the log can never
- * touch a filesystem and a recovery can read it back with a single dd:
+ * Instead sweet_log_append() calls mido_log_pump() after every append (see
+ * 0047), and this function writes whatever has accumulated as soon as 4 KiB is
+ * available.  By the time the console is busy the eMMC is up, so the pump is a
+ * no-op for the early lines and catches everything from the SDHCI probe on.
  *
- *   header : "MIDOLOG" | u32 version | u32 ring size | u64 total | u64 seq
- *            at SYSTEM sector 0
- *   ring   : console byte n lives at ring offset n % ring size, ring block b
- *            lives at SYSTEM sector 1 + b
+ *   SYSTEM sector 0         "MIDOLOG" | u32 version | u32 size
+ *                           | u64 total bytes written | u64 flush sequence
+ *   SYSTEM sectors 1..8192  the 4 MiB ring, ring block b at sector 1 + b
  *
- * header.total is how many bytes have been written since boot, which is what
- * tools/mido-log-pull.py needs to unroll the ring.
+ * Console byte n is at ring offset n % size, so header.total unrolls it.
+ * Disabled with boot-arg mido_log=0.
  *
- * Disabled with boot-arg mido_log=0.  A write error stops the thread instead of
- * retrying: the only reachable causes are a dead card or a partition that moved,
- * and both make a retry pointless.
+ * The pump runs from arbitrary console contexts, so it refuses to touch the
+ * card while a panic is in progress: SDHCI writes are polled with multi-second
+ * timeouts, and blocking a panic path on a dead card would lose the panic text
+ * instead of saving it.
  */
 #define MIDO_LOG_RING_SIZE      (4u << 20)
 #define MIDO_LOG_BLOCK          SDHCI_BLOCK
 #define MIDO_LOG_RING_BLOCKS    (MIDO_LOG_RING_SIZE / MIDO_LOG_BLOCK)
 #define MIDO_LOG_MAX_WRITE      64u     /* 32 KiB per write */
+#define MIDO_LOG_PUMP_BYTES     4096u   /* write once this much is buffered */
 
 struct mido_log_header {
 	char     magic[8];
@@ -3269,86 +3272,76 @@ struct mido_log_header {
 
 extern char *sweet_log_ring_base(void);         /* bsd/dev/sweet_ufs.c */
 extern uint64_t sweet_log_bytes(void);          /* bsd/dev/sweet_ufs.c */
-extern int hz;
-extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
-extern void thread_deallocate(thread_t);
+extern int panic_active(void);                  /* kern/debug.c */
 
-static int mido_log_chan;
+static uint64_t mido_log_flushed;
+static uint32_t mido_log_seq;
 
-void mido_log_start(void);
+void mido_log_pump(uint64_t total);
 
-static void
-mido_log_thread(__unused void *arg, __unused wait_result_t wr)
+void
+mido_log_pump(uint64_t total)
 {
 	uint64_t base = se.sys_first_block;
-	uint64_t flushed = 0, seq = 0;
-	const char *ring = sweet_log_ring_base();
+	const char *ring;
+	uint64_t pos;
+	int error = 0;
 
-	printf("MIDO LOG: console log to SYSTEM sector 0x%llx, %u KiB ring\n",
-	    (unsigned long long)base, MIDO_LOG_RING_SIZE >> 10);
-	for (;;) {
-		uint64_t total, pos;
-		int error = 0;
+	if (!se.log_ok || base == 0 || total <= mido_log_flushed) {
+		return;
+	}
+	if (total - mido_log_flushed < MIDO_LOG_PUMP_BYTES &&
+	    total < MIDO_LOG_PUMP_BYTES) {
+		return;
+	}
+	if (panic_active()) {
+		return;
+	}
 
-		(void)tsleep(&mido_log_chan, PZERO, "midolog", hz);
-		total = sweet_log_bytes();
-		if (total == flushed) {
-			continue;
-		}
+	ring = sweet_log_ring_base();
+	pos = (total - mido_log_flushed >= MIDO_LOG_RING_SIZE) ?
+	    total - MIDO_LOG_RING_SIZE : mido_log_flushed;
+	pos &= ~(uint64_t)(MIDO_LOG_BLOCK - 1);
 
-		/* Never replay more than one ring, and start on a block edge. */
-		pos = (total - flushed >= MIDO_LOG_RING_SIZE) ?
-		    total - MIDO_LOG_RING_SIZE : flushed;
-		pos &= ~(uint64_t)(MIDO_LOG_BLOCK - 1);
+	while (pos < total && !error) {
+		uint32_t blk = (uint32_t)((pos / MIDO_LOG_BLOCK) %
+		    MIDO_LOG_RING_BLOCKS);
+		uint64_t want = (total - pos + MIDO_LOG_BLOCK - 1) /
+		    MIDO_LOG_BLOCK;
+		uint32_t n = (uint32_t)MIN(want,
+		    (uint64_t)(MIDO_LOG_RING_BLOCKS - blk));
 
-		while (pos < total && !error) {
-			uint32_t blk = (uint32_t)((pos / MIDO_LOG_BLOCK) %
-			    MIDO_LOG_RING_BLOCKS);
-			uint64_t want = (total - pos + MIDO_LOG_BLOCK - 1) /
-			    MIDO_LOG_BLOCK;
-			uint32_t n = (uint32_t)MIN(want,
-			    (uint64_t)(MIDO_LOG_RING_BLOCKS - blk));
-
-			n = (uint32_t)MIN((uint64_t)n,
-			    (uint64_t)MIDO_LOG_MAX_WRITE);
-			error = mido_sdhci_write_log_blocks(base + 1 + blk, n,
-			    ring + (uint64_t)blk * MIDO_LOG_BLOCK);
-			if (!error) {
-				pos += (uint64_t)n * MIDO_LOG_BLOCK;
-			}
-		}
+		n = (uint32_t)MIN((uint64_t)n, (uint64_t)MIDO_LOG_MAX_WRITE);
+		error = mido_sdhci_write_log_blocks(base + 1 + blk, n,
+		    ring + (uint64_t)blk * MIDO_LOG_BLOCK);
 		if (!error) {
-			struct mido_log_header h;
+			pos += (uint64_t)n * MIDO_LOG_BLOCK;
+		}
+	}
 
-			bzero(&h, sizeof(h));
-			memcpy(h.magic, "MIDOLOG", 8);
-			h.version = 1;
-			h.size = MIDO_LOG_RING_SIZE;
-			h.total = total;
-			h.seq = ++seq;
-			error = mido_sdhci_write_log_blocks(base, 1, &h);
-		}
-		if (error) {
-			printf("MIDO LOG: write failed (%d), stopping\n", error);
-			return;
-		}
-		flushed = total;
+	if (!error) {
+		struct mido_log_header h;
+
+		bzero(&h, sizeof(h));
+		memcpy(h.magic, "MIDOLOG", 8);
+		h.version = 1;
+		h.size = MIDO_LOG_RING_SIZE;
+		h.total = total;
+		h.seq = ++mido_log_seq;
+		error = mido_sdhci_write_log_blocks(base, 1, &h);
+	}
+	if (!error) {
+		mido_log_flushed = pos > total ? total : pos;
 	}
 }
 
 void
 mido_log_start(void)
 {
-	uint32_t on = 1;
-	thread_t thread;
-
-	PE_parse_boot_argn("mido_log", &on, sizeof(on));
-	if (!on || !se.log_ok || se.sys_first_block == 0) {
-		return;
-	}
-	if (kernel_thread_start(mido_log_thread, NULL, &thread) == KERN_SUCCESS) {
-		thread_deallocate(thread);
-	}
+	/*
+	 * Nothing to start: sweet_log_append() drives mido_log_pump() directly.
+	 * Kept so mido_sdhci_init() still says "the log is now live".
+	 */
 }
 
 int

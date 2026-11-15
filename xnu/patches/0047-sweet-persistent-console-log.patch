@@ -16,7 +16,7 @@
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -591,9 +596,133 @@
+@@ -591,9 +596,148 @@
  	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
@@ -47,6 +47,20 @@
 +/* Called for all console output, any context: never blocks. */
 +void sweet_log_append(const char *c, int size);
 +
++/*
++ * mido: the eMMC port cannot use the thread below (mido_sdhci_init runs from
++ * IOKitBSDInit, before kernel_thread_start is usable), so it writes the ring
++ * from this path instead.  Weak, so boards that keep the UFS thread link
++ * without providing it.
++ */
++void mido_log_pump(uint64_t total) __attribute__((weak));
++
++void
++mido_log_pump(uint64_t total)
++{
++	(void)total;
++}
++
 +void
 +sweet_log_append(const char *c, int size)
 +{
@@ -57,6 +71,7 @@
 +	for (int i = 0; i < size; i++) {
 +		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
 +	}
++	mido_log_pump(at + (uint64_t)size);
 +}
 +
 +/*
