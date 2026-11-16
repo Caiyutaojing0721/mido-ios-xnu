@@ -1,0 +1,3 @@
+archive: dxb/fakeroot/usr/local/lib/kernel/libfirehose_kernel.a
+Non-fat file: dxb/fakeroot/usr/local/lib/kernel/libfirehose_kernel.a is architecture: arm64
+dxb/build/libfirehose_kernel.obj/libdispatch.build/Release/libfirehose_kernel.build
