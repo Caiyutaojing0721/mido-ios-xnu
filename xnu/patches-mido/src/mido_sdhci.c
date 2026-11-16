@@ -3251,10 +3251,9 @@ mido_gcc_enable_clocks(void)
  * Console byte n is at ring offset n % size, so header.total unrolls it.
  * Disabled with boot-arg mido_log=0.
  *
- * The pump runs from arbitrary console contexts, so it refuses to touch the
- * card while a panic is in progress: SDHCI writes are polled with multi-second
- * timeouts, and blocking a panic path on a dead card would lose the panic text
- * instead of saving it.
+ * The pump runs from arbitrary console contexts, panic included: there it can
+ * wait out an SDHCI timeout, which is slower than ideal but still puts the
+ * panic text on the card instead of losing it with the ring.
  */
 #define MIDO_LOG_RING_SIZE      (4u << 20)
 #define MIDO_LOG_BLOCK          SDHCI_BLOCK
@@ -3272,7 +3271,6 @@ struct mido_log_header {
 
 extern char *sweet_log_ring_base(void);         /* bsd/dev/sweet_ufs.c */
 extern uint64_t sweet_log_bytes(void);          /* bsd/dev/sweet_ufs.c */
-extern boolean_t panic_active(void);                  /* kern/debug.c */
 
 static uint64_t mido_log_flushed;
 static uint32_t mido_log_seq;
@@ -3292,9 +3290,6 @@ mido_log_pump(uint64_t total)
 	}
 	if (total - mido_log_flushed < MIDO_LOG_PUMP_BYTES &&
 	    total < MIDO_LOG_PUMP_BYTES) {
-		return;
-	}
-	if (panic_active()) {
 		return;
 	}
 

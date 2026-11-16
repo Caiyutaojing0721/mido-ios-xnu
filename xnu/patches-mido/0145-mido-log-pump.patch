@@ -63,10 +63,9 @@ The header and layout are unchanged from 0143, and so is tools/mido-log-pull.py.
 - * Disabled with boot-arg mido_log=0.  A write error stops the thread instead of
 - * retrying: the only reachable causes are a dead card or a partition that moved,
 - * and both make a retry pointless.
-+ * The pump runs from arbitrary console contexts, so it refuses to touch the
-+ * card while a panic is in progress: SDHCI writes are polled with multi-second
-+ * timeouts, and blocking a panic path on a dead card would lose the panic text
-+ * instead of saving it.
++ * The pump runs from arbitrary console contexts, panic included: there it can
++ * wait out an SDHCI timeout, which is slower than ideal but still puts the
++ * panic text on the card instead of losing it with the ring.
   */
  #define MIDO_LOG_RING_SIZE      (4u << 20)
  #define MIDO_LOG_BLOCK          SDHCI_BLOCK
@@ -76,14 +75,13 @@ The header and layout are unchanged from 0143, and so is tools/mido-log-pull.py.
  
  struct mido_log_header {
  	char     magic[8];
-@@ -3269,86 +3272,76 @@
+@@ -3269,86 +3272,72 @@
  
  extern char *sweet_log_ring_base(void);         /* bsd/dev/sweet_ufs.c */
  extern uint64_t sweet_log_bytes(void);          /* bsd/dev/sweet_ufs.c */
 -extern int hz;
 -extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 -extern void thread_deallocate(thread_t);
-+extern boolean_t panic_active(void);                  /* kern/debug.c */
  
 -static int mido_log_chan;
 +static uint64_t mido_log_flushed;
@@ -120,9 +118,6 @@ The header and layout are unchanged from 0143, and so is tools/mido-log-pull.py.
 +	}
 +	if (total - mido_log_flushed < MIDO_LOG_PUMP_BYTES &&
 +	    total < MIDO_LOG_PUMP_BYTES) {
-+		return;
-+	}
-+	if (panic_active()) {
 +		return;
 +	}
  
