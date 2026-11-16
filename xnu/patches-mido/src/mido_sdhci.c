@@ -3272,7 +3272,7 @@ struct mido_log_header {
 
 extern char *sweet_log_ring_base(void);         /* bsd/dev/sweet_ufs.c */
 extern uint64_t sweet_log_bytes(void);          /* bsd/dev/sweet_ufs.c */
-extern int panic_active(void);                  /* kern/debug.c */
+extern boolean_t panic_active(void);                  /* kern/debug.c */
 
 static uint64_t mido_log_flushed;
 static uint32_t mido_log_seq;

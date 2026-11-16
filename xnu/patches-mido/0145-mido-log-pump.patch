@@ -83,7 +83,7 @@ The header and layout are unchanged from 0143, and so is tools/mido-log-pull.py.
 -extern int hz;
 -extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 -extern void thread_deallocate(thread_t);
-+extern int panic_active(void);                  /* kern/debug.c */
++extern boolean_t panic_active(void);                  /* kern/debug.c */
  
 -static int mido_log_chan;
 +static uint64_t mido_log_flushed;
