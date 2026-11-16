@@ -1,0 +1,31 @@
+[33;01m[warning] [39;49;00mSkipping patch /Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/patches/0077-sweet-usb-live-log.patch (already upstream, previously applied, or malformed): error: patch failed: bsd/dev/sweet_ufs.c:700
+error: bsd/dev/sweet_ufs.c: patch does not apply
+[33;01m[warning] [39;49;00mSkipping patch /Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/patches/0145-mido-log-pump.patch (already upstream, previously applied, or malformed): error: corrupt patch at line 78
+[33;01m[warning] [39;49;00mSkipping patch /Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/patches/iobuffermemd_monterey.patch (already upstream, previously applied, or malformed): error: patch failed: iokit/Kernel/IOBufferMemoryDescriptor.cpp:332
+error: iokit/Kernel/IOBufferMemoryDescriptor.cpp: patch does not apply
+[33;01m[warning] [39;49;00mSkipping patch /Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/patches/skywalk_sonoma.patch (already upstream, previously applied, or malformed): error: patch failed: bsd/skywalk/packet/os_packet.h:883
+error: bsd/skywalk/packet/os_packet.h: patch does not apply
+[33;01m[warning] [39;49;00mSkipping patch /Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/patches/syntax_checker_sonoma.patch (already upstream, previously applied, or malformed): error: patch failed: tools/lldbmacros/core/syntax_checker.py:1
+error: tools/lldbmacros/core/syntax_checker.py: patch does not apply
+[33;01m[warning] [39;49;00mSkipping patch /Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/patches/TrustCache.patch (already upstream, previously applied, or malformed): error: EXTERNAL_HEADERS/TrustCache/API.h: already exists in working directory
+error: EXTERNAL_HEADERS/TrustCache/RawTypes.h: already exists in working directory
+error: EXTERNAL_HEADERS/TrustCache/Return.h: already exists in working directory
+error: EXTERNAL_HEADERS/TrustCache/Types.h: already exists in working directory
+error: EXTERNAL_HEADERS/TrustCache/TypesConfig.h: already exists in working directory
+find: /Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/fakeroot: No such file or directory
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_attrlist.c:105:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_attrlist.c:157:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+In file included from /Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_quota.c:103:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_quota.c:148:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_quota.c:221:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_quota.c:301:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_quota.c:374:5: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_quota.c:440:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_quota.c:559:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_quota.c:739:5: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_quota.c:797:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_quota.c:823:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_quota.c:885:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_quota.c:952:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_quota.c:996:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
+/Users/runner/work/mido-ios-xnu/mido-ios-xnu/dxb/xnu/bsd/sweet_hfs/core/hfs_search.c:161:1: warning: a function definition without a prototype is deprecated in all versions of C and is not supported in C2x [-Wdeprecated-non-prototype]
